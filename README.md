@@ -72,6 +72,12 @@ python scripts/mcp_client_installer.py --uninstall  # remove entries and delete 
 python scripts/mcp_client_installer.py --config     # print a generic JSON config snippet
 ```
 
+For Codex, `--install` also installs the bundled Binary Ninja analysis skill at
+`${CODEX_HOME:-~/.codex}/skills/binary-ninja`. `--uninstall` removes only the
+files managed by this repository and preserves unrelated files in that skill
+directory. Start a new Codex task after installation so the skill catalog is
+refreshed.
+
 #### Using npm package (Recommended)
 
 The recommended way to set up the MCP client is using the official npm package:

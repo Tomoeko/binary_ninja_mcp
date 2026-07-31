@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import shutil
 import sys
 
 # Import shared utilities
@@ -23,6 +24,8 @@ except ImportError:
 
 # Unique key used in MCP client configs
 MCP_SERVER_KEY = "binary_ninja_mcp"
+CODEX_SKILL_NAME = "binary-ninja"
+CODEX_SKILL_FILES = ("SKILL.md", os.path.join("agents", "openai.yaml"))
 
 
 def _repo_root() -> str:
@@ -47,6 +50,86 @@ def _venv_python() -> str:
         py = os.path.join(d, "Scripts", "python.exe")
         return py
     return os.path.join(d, "bin", "python3")
+
+
+def _codex_skill_source() -> str:
+    return os.path.join(_repo_root(), "skills", CODEX_SKILL_NAME)
+
+
+def _codex_skill_target(codex_home: str | None = None) -> str:
+    if codex_home is None:
+        codex_home = os.environ.get("CODEX_HOME")
+    if not codex_home:
+        codex_home = os.path.join(os.path.expanduser("~"), ".codex")
+    root = os.path.abspath(os.path.expanduser(codex_home))
+    return os.path.join(root, "skills", CODEX_SKILL_NAME)
+
+
+def _same_file(left: str, right: str) -> bool:
+    if not os.path.isfile(left) or not os.path.isfile(right):
+        return False
+    if os.path.getsize(left) != os.path.getsize(right):
+        return False
+    with open(left, "rb") as left_file, open(right, "rb") as right_file:
+        return left_file.read() == right_file.read()
+
+
+def install_codex_skill(
+    *,
+    uninstall: bool = False,
+    quiet: bool = False,
+    codex_home: str | None = None,
+) -> bool:
+    """Install or remove the bundled Codex skill.
+
+    Only files shipped in ``skills/binary-ninja`` are managed. Extra files in
+    the destination are preserved during install and uninstall.
+    """
+    source = _codex_skill_source()
+    target = _codex_skill_target(codex_home)
+    if not os.path.isdir(source):
+        if not quiet:
+            print(f"Skipping Codex skill: bundled source not found\n  Source: {source}")
+        return False
+    if os.path.islink(target):
+        raise RuntimeError(f"Refusing to manage symlinked Codex skill directory: {target}")
+
+    changed = False
+    if uninstall:
+        for relative_path in reversed(CODEX_SKILL_FILES):
+            destination = os.path.join(target, relative_path)
+            if os.path.islink(destination):
+                raise RuntimeError(f"Refusing to remove symlinked Codex skill file: {destination}")
+            if os.path.isfile(destination):
+                os.remove(destination)
+                changed = True
+
+        for directory in (os.path.join(target, "agents"), target):
+            try:
+                os.rmdir(directory)
+            except (FileNotFoundError, OSError):
+                pass
+    else:
+        for relative_path in CODEX_SKILL_FILES:
+            source_file = os.path.join(source, relative_path)
+            destination = os.path.join(target, relative_path)
+            if os.path.islink(destination):
+                raise RuntimeError(
+                    f"Refusing to overwrite symlinked Codex skill file: {destination}"
+                )
+            if _same_file(source_file, destination):
+                continue
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            shutil.copy2(source_file, destination)
+            changed = True
+
+    if not quiet:
+        if changed:
+            status = "Uninstalled" if uninstall else "Installed"
+        else:
+            status = "Already absent" if uninstall else "Already current"
+        print(f"{status} Codex skill\n  Skill: {target}")
+    return changed
 
 
 def ensure_local_venv() -> str:
@@ -293,6 +376,7 @@ def main():
 
     if args.uninstall:
         install_mcp_servers(uninstall=True, quiet=args.quiet)
+        install_codex_skill(uninstall=True, quiet=args.quiet)
         # Also remove auto-setup sentinel so the plugin can re-run setup later
         sentinel = os.path.join(_repo_root(), ".mcp_auto_setup_done")
         try:
@@ -309,6 +393,7 @@ def main():
     # Default action is install if no flag is provided
     if args.install or (not args.uninstall and not args.config):
         install_mcp_servers(quiet=args.quiet)
+        install_codex_skill(quiet=args.quiet)
 
 
 if __name__ == "__main__":
