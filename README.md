@@ -125,6 +125,53 @@ For other MCP clients, use the Python bridge directly:
 
 Note: Replace `/ABSOLUTE/PATH/TO` with the actual absolute path to your project directory. The virtual environment's Python interpreter must be used to access the installed dependencies.
 
+### Headless Binary Ninja for Codex
+
+The headless launcher starts Binary Ninja's Python API, the local HTTP service, and
+the MCP stdio bridge as one command. The Binary Ninja GUI does not need to be open.
+
+First verify the same Python runtime Binary Ninja uses:
+
+```bash
+PYTHONPATH="/Applications/Binary Ninja.app/Contents/Resources/python" \
+python3.13 -c "import binaryninja"
+```
+
+Then validate that the native architecture and file-format plugins also initialize:
+
+```bash
+python3.13 scripts/run_headless_mcp.py --check
+```
+
+The import check alone is not sufficient: `--check` intentionally fails if Binary
+Ninja exposes only `Raw`/`Mapped` views or no architectures, because that runtime
+would open files without producing useful functions or decompilation.
+
+The launcher needs a Python environment containing `mcp` and `requests` for the
+stdio bridge. It automatically detects this repository's `.venv` and the virtual
+environment created by the installed Binary Ninja plugin. You can also select one:
+
+```bash
+export BINJA_MCP_BRIDGE_PYTHON="/absolute/path/to/.venv/bin/python"
+```
+
+Add the launcher to Codex's MCP configuration:
+
+```toml
+[mcp_servers.binary_ninja]
+command = "python3.13"
+args = ["/ABSOLUTE/PATH/TO/binary_ninja_mcp/scripts/run_headless_mcp.py"]
+startup_timeout_sec = 45
+tool_timeout_sec = 120
+default_tools_approval_mode = "approve"
+```
+
+After Codex restarts, use the `open_binary` MCP tool with an absolute path. A
+startup target can instead be supplied by appending `--binary`, followed by its
+path, to `args`. The `approve` mode trusts every tool exposed by this MCP server
+without per-call prompts; leave `enabled_tools` unset to expose the complete tool
+set.
+
 ## Usage
 
 1. Open Binary Ninja and load a binary
@@ -175,6 +222,7 @@ The following table lists the available MCP functions for use:
 | `fetch_disassembly`                                              | Get the assembly representation of a function by name or address.                                            |
 | `get_entry_points()`                                                 | List entry point(s) of the loaded binary.                                                                    |
 | `get_binary_status`                                                  | Get the current status of the loaded binary.                                                                 |
+| `open_binary(filepath)`                                              | Open and select a local binary in a GUI-free/headless session.                                               |
 | `get_comment`                                                        | Get the comment at a specific address.                                                                       |
 | `get_function_comment`                                               | Get the comment for a function.                                                                              |
 | `get_user_defined_type`                                              | Retrieve definition of a user-defined type (struct, enumeration, typedef, union).                            |

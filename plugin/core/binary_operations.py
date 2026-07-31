@@ -1,3 +1,4 @@
+import os
 import platform
 import re
 import subprocess
@@ -20,6 +21,9 @@ class BinaryOperations:
         self._views_by_id: dict[str, weakref.ReferenceType] = {}
         self._next_view_id: int = 1
         self._id_by_filename: dict[str, str] = {}
+        # Views opened through /load have no GUI owner. Keep strong references
+        # to them until the headless host shuts down.
+        self._owned_views: dict[str, bn.BinaryView] = {}
 
     @property
     def current_view(self) -> bn.BinaryView | None:
@@ -40,9 +44,21 @@ class BinaryOperations:
     def load_binary(self, filepath: str) -> bn.BinaryView:
         """Load a binary file using the appropriate method based on the Binary Ninja API version"""
         try:
-            if hasattr(bn, "open_view"):
+            canonical_path = os.path.realpath(os.path.expanduser(filepath))
+            if not os.path.isfile(canonical_path):
+                raise FileNotFoundError(f"Binary does not exist: {canonical_path}")
+
+            existing = self._owned_views.get(canonical_path)
+            if existing is not None:
+                self.current_view = existing
+                return existing
+
+            if hasattr(bn, "load"):
+                bn.log_info("Using bn.load method")
+                self._current_view = bn.load(canonical_path)
+            elif hasattr(bn, "open_view"):
                 bn.log_info("Using bn.open_view method")
-                self._current_view = bn.open_view(filepath)
+                self._current_view = bn.open_view(canonical_path)
             elif hasattr(bn, "BinaryViewType") and hasattr(bn.BinaryViewType, "get_view_of_file"):
                 bn.log_info("Using BinaryViewType.get_view_of_file method")
                 file_metadata = bn.FileMetadata()
@@ -50,34 +66,51 @@ class BinaryOperations:
                     if hasattr(bn.BinaryViewType, "get_default_options"):
                         options = bn.BinaryViewType.get_default_options()
                         self._current_view = bn.BinaryViewType.get_view_of_file(
-                            filepath, file_metadata, options
+                            canonical_path, file_metadata, options
                         )
                     else:
                         self._current_view = bn.BinaryViewType.get_view_of_file(
-                            filepath, file_metadata
+                            canonical_path, file_metadata
                         )
                 except TypeError:
-                    self._current_view = bn.BinaryViewType.get_view_of_file(filepath)
+                    self._current_view = bn.BinaryViewType.get_view_of_file(canonical_path)
             else:
                 bn.log_info("Using legacy method")
                 file_metadata = bn.FileMetadata()
                 binary_view_type = bn.BinaryViewType.get_view_of_file_with_options(
-                    filepath, file_metadata
+                    canonical_path, file_metadata
                 )
                 if binary_view_type:
                     self._current_view = binary_view_type.open()
                 else:
                     raise Exception("No view type available for this file")
 
-            try:
-                if self._current_view is not None:
-                    self._register_view(self._current_view)
-            except Exception:
-                pass
-            return self._current_view
+            if self._current_view is None:
+                raise RuntimeError(f"Binary Ninja could not create a view for: {canonical_path}")
+
+            loaded_view = self._current_view
+            self._owned_views[canonical_path] = loaded_view
+            self._register_view(loaded_view)
+            # _register_view prunes stale GUI views; on the very first load its
+            # initial prune may clear current_view before registering this one.
+            self._current_view = loaded_view
+            return loaded_view
         except Exception as e:
             bn.log_error(f"Failed to load binary: {e}")
             raise
+
+    def close_owned_views(self) -> None:
+        """Close BinaryViews opened by this service and release their owners."""
+        views = list(self._owned_views.values())
+        self._owned_views.clear()
+        self._current_view = None
+        self._views_by_id.clear()
+        self._id_by_filename.clear()
+        for view in views:
+            try:
+                view.file.close()
+            except Exception as e:
+                bn.log_warn(f"Failed to close BinaryView: {e}")
 
     # ---------------- Multi-binary helpers ----------------
     def _prune_views(self) -> None:

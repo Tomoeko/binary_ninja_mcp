@@ -864,6 +864,18 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
   );
 
   server.tool(
+    "open_binary",
+    "Open a local binary in the Binary Ninja service and select it.",
+    {
+      filepath: z.string().describe("Absolute path to the binary on the MCP host"),
+    },
+    async ({ filepath }) => {
+      const result = await client.post("load", { filepath });
+      return { content: [{ type: "text", text: result }] };
+    }
+  );
+
+  server.tool(
     "list_binaries",
     "List managed/open binaries known to the server with ids and active flag.",
     {},

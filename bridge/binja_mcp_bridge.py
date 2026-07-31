@@ -11,9 +11,18 @@ def _bridge_excepthook(exc_type, exc, tb):
 _sys.excepthook = _bridge_excepthook
 
 import requests
-from mcp.server.fastmcp import FastMCP
+import os as _os
 
-binja_server_url = "http://localhost:9009"
+try:
+    from mcp.server.fastmcp import FastMCP
+except ModuleNotFoundError:
+    # MCP SDK 2.x renamed the ergonomic server class while retaining the
+    # decorator and stdio run interfaces used by this bridge.
+    from mcp.server.mcpserver import MCPServer as FastMCP
+
+_binja_host = _os.environ.get("BINJA_MCP_HOST", "localhost")
+_binja_port = _os.environ.get("BINJA_MCP_PORT", "9009")
+binja_server_url = f"http://{_binja_host}:{_binja_port}"
 mcp = FastMCP("binja-mcp")
 
 
@@ -597,6 +606,28 @@ def get_binary_status() -> str:
     Get the current status of the loaded binary.
     """
     return safe_get("status")[0]
+
+
+@mcp.tool()
+def open_binary(filepath: str) -> str:
+    """Open a local binary in the headless Binary Ninja service and select it."""
+    try:
+        response = requests.post(
+            f"{binja_server_url}/load",
+            json={"filepath": filepath},
+            timeout=120,
+        )
+        try:
+            data = response.json()
+        except Exception:
+            data = None
+        if response.ok and isinstance(data, dict):
+            return data.get("message") or f"Binary loaded: {filepath}"
+        if isinstance(data, dict) and data.get("error"):
+            return f"Error: {data['error']}"
+        return f"Error {response.status_code}: {response.text.strip()}"
+    except Exception as exc:
+        return f"Request failed: {exc}"
 
 
 @mcp.tool()

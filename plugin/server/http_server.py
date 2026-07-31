@@ -1902,11 +1902,13 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            if not self._check_binary_loaded():
+            path = urllib.parse.urlparse(self.path).path
+            # /load is the bootstrap endpoint for headless sessions, so it must
+            # remain available before a BinaryView exists.
+            if path != "/load" and not self._check_binary_loaded():
                 return
 
             params = self._parse_post_params()
-            path = urllib.parse.urlparse(self.path).path
 
             bn.log_info(f"POST {path} with params: {params}")
 
