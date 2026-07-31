@@ -143,6 +143,20 @@ def safe_post(endpoint: str, data: dict | str) -> str:
         return f"Request failed: {e!s}"
 
 
+def safe_delete(endpoint: str, params: dict | None = None) -> str:
+    """Perform a DELETE request and return raw text (or an error string)."""
+    try:
+        response = requests.delete(
+            f"{binja_server_url}/{endpoint}", params=params or {}, timeout=5
+        )
+        response.encoding = "utf-8"
+        if response.ok:
+            return response.text.strip()
+        return f"Error {response.status_code}: {response.text.strip()}"
+    except Exception as e:
+        return f"Request failed: {e!s}"
+
+
 @mcp.tool()
 def list_methods(offset: int = 0, limit: int = 100) -> list:
     """
@@ -233,21 +247,20 @@ def rename_multi_variables(
     else:
         params["functionName"] = ident
 
-    payload = None
     import json as _json
 
     if renames_json:
         try:
-            payload = _json.loads(renames_json)
+            _json.loads(renames_json)
         except Exception:
             return "Error: renames_json is not valid JSON"
-        params["renames"] = payload
+        params["renames"] = renames_json
     elif mapping_json:
         try:
-            payload = _json.loads(mapping_json)
+            _json.loads(mapping_json)
         except Exception:
             return "Error: mapping_json is not valid JSON"
-        params["mapping"] = payload
+        params["mapping"] = mapping_json
     elif pairs:
         params["pairs"] = pairs
     else:
@@ -695,7 +708,7 @@ def delete_comment(address: str) -> str:
     """
     Delete the comment at a specific address.
     """
-    return safe_post("comment", {"address": address, "_method": "DELETE"})
+    return safe_delete("comment", {"address": address})
 
 
 @mcp.tool()
@@ -703,7 +716,7 @@ def delete_function_comment(function_name: str) -> str:
     """
     Delete the comment for a function.
     """
-    return safe_post("comment/function", {"name": function_name, "_method": "DELETE"})
+    return safe_delete("comment/function", {"name": function_name})
 
 
 @mcp.tool()
@@ -711,7 +724,7 @@ def function_at(address: str) -> str:
     """
     Retrive the name of the function the address belongs to. Address must be in hexadecimal format 0x00001
     """
-    return safe_get("functionAt", {"address": address})
+    return "\n".join(safe_get("functionAt", {"address": address}))
 
 
 @mcp.tool()
@@ -719,7 +732,7 @@ def get_user_defined_type(type_name: str) -> str:
     """
     Retrive definition of a user defined type (struct, enumeration, typedef, union)
     """
-    return safe_get("getUserDefinedType", {"name": type_name})
+    return "\n".join(safe_get("getUserDefinedType", {"name": type_name}))
 
 
 @mcp.tool()

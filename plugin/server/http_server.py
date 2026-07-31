@@ -1469,6 +1469,11 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 # Prefer explicit 'renames' in JSON when POSTed
                 if isinstance(params, dict) and "renames" in params:
                     raw_renames = params.get("renames")
+                    if isinstance(raw_renames, str):
+                        try:
+                            raw_renames = json.loads(raw_renames)
+                        except Exception:
+                            raw_renames = None
                 # Or a JSON mapping under 'mapping'
                 if raw_renames is None and "mapping" in params:
                     try:
@@ -1899,6 +1904,10 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 },
                 500,
             )
+
+    def do_DELETE(self):
+        """Route DELETE requests through the shared query-parameter handlers."""
+        self.do_GET()
 
     def do_POST(self):
         try:

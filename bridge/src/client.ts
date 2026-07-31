@@ -97,6 +97,24 @@ export class BinjaHttpClient {
     }
   }
 
+  /**
+   * Perform a DELETE request with query parameters.
+   */
+  async delete(endpoint: string, params: Record<string, string | number> = {}): Promise<string> {
+    try {
+      const response = await this.client.delete<string>(endpoint, {
+        params,
+        responseType: "text",
+      });
+      if (response.status >= 200 && response.status < 300) {
+        return response.data.trim();
+      }
+      return `Error ${response.status}: ${response.data}`;
+    } catch (error) {
+      return this.handleError(error, "DELETE", endpoint);
+    }
+  }
+
   private handleError(error: unknown, method: string, endpoint: string): string {
     const msg = this.getErrorMessage(error);
     return `Error: ${method} ${endpoint} failed: ${msg}`;

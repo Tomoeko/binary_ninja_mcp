@@ -23,6 +23,10 @@ class BinaryNinjaEndpoints:
         """Get entry point(s) for the current binary"""
         return self.binary_ops.get_entry_points()
 
+    def list_platforms(self) -> dict[str, list[str]]:
+        """List the platform names registered with Binary Ninja."""
+        return {"platforms": sorted(platform.name for platform in bn.Platform)}
+
     # -------- Multi-binary helpers --------
     def _format_binary_listing(self, raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Normalize binary listing entries with ordinal, view id, basename, and selectors."""

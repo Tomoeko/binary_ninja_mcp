@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -140,7 +141,13 @@ def host_environment(bn_python_path: Path) -> dict[str, str]:
     return env
 
 
-def wait_for_host(process: subprocess.Popen, host: str, port: int, timeout: float) -> None:
+def wait_for_host(
+    process: subprocess.Popen,
+    host: str,
+    port: int,
+    timeout: float,
+    require_loaded: bool = False,
+) -> None:
     deadline = time.monotonic() + timeout
     url = f"http://{host}:{port}/status"
     while time.monotonic() < deadline:
@@ -151,7 +158,10 @@ def wait_for_host(process: subprocess.Popen, host: str, port: int, timeout: floa
             )
         try:
             with urllib.request.urlopen(url, timeout=0.5) as response:
-                if response.status == 200:
+                status = json.load(response)
+                if response.status == 200 and (
+                    not require_loaded or bool(status.get("loaded"))
+                ):
                     return
         except (urllib.error.URLError, TimeoutError):
             pass
@@ -202,7 +212,13 @@ def main(argv: list[str] | None = None) -> int:
             stdout=sys.stderr,
             stderr=sys.stderr,
         )
-        wait_for_host(host_process, args.host, args.port, args.startup_timeout)
+        wait_for_host(
+            host_process,
+            args.host,
+            args.port,
+            args.startup_timeout,
+            require_loaded=bool(args.binary),
+        )
 
         bridge_env = os.environ.copy()
         bridge_env["BINJA_MCP_HOST"] = args.host
