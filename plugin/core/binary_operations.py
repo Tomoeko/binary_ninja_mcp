@@ -1,8 +1,11 @@
+import json
 import os
 import platform
 import re
 import subprocess
+import threading
 import weakref
+from pathlib import Path
 from typing import Any
 
 import binaryninja as bn
@@ -24,6 +27,7 @@ class BinaryOperations:
         # Views opened through /load have no GUI owner. Keep strong references
         # to them until the headless host shuts down.
         self._owned_views: dict[str, bn.BinaryView] = {}
+        self._load_lock = threading.RLock()
 
     @property
     def current_view(self) -> bn.BinaryView | None:
@@ -41,60 +45,102 @@ class BinaryOperations:
         else:
             bn.log_info("Cleared current binary view")
 
-    def load_binary(self, filepath: str) -> bn.BinaryView:
-        """Load a binary file using the appropriate method based on the Binary Ninja API version"""
+    @staticmethod
+    def _sidecar_image_base(canonical_path: str) -> int | None:
+        """Read an optional image base from an adjacent JSON capture manifest."""
+        path = Path(canonical_path)
+        candidates = [path.with_suffix(".json"), Path(f"{canonical_path}.json")]
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            try:
+                metadata = json.loads(candidate.read_text(encoding="utf-8"))
+                value = metadata.get("base")
+                if value is None:
+                    value = metadata.get("image_base")
+                if value is None:
+                    continue
+                parsed = int(str(value), 0)
+                if parsed < 0:
+                    raise ValueError("image base cannot be negative")
+                return parsed
+            except Exception as exc:
+                bn.log_warn(f"Ignoring invalid Binary Ninja sidecar {candidate}: {exc}")
+        return None
+
+    def load_binary(
+        self,
+        filepath: str,
+        *,
+        analysis_mode: str = "basic",
+        platform_name: str | None = None,
+        image_base: int | None = None,
+    ) -> bn.BinaryView:
+        """Open a binary promptly and schedule analysis in the background.
+
+        ``bn.load`` waits for full analysis by default. That can take minutes
+        and several GiB for flat firmware images, which previously blocked the
+        sole HTTP request handler until the MCP client timed out. View creation
+        is intentionally nonblocking here; callers can observe progress through
+        ``/status`` while Binary Ninja analyzes the registered view.
+        """
         try:
             canonical_path = os.path.realpath(os.path.expanduser(filepath))
             if not os.path.isfile(canonical_path):
                 raise FileNotFoundError(f"Binary does not exist: {canonical_path}")
 
-            existing = self._owned_views.get(canonical_path)
-            if existing is not None:
-                self.current_view = existing
-                return existing
-
-            if hasattr(bn, "load"):
-                bn.log_info("Using bn.load method")
-                self._current_view = bn.load(canonical_path)
-            elif hasattr(bn, "open_view"):
-                bn.log_info("Using bn.open_view method")
-                self._current_view = bn.open_view(canonical_path)
-            elif hasattr(bn, "BinaryViewType") and hasattr(bn.BinaryViewType, "get_view_of_file"):
-                bn.log_info("Using BinaryViewType.get_view_of_file method")
-                file_metadata = bn.FileMetadata()
-                try:
-                    if hasattr(bn.BinaryViewType, "get_default_options"):
-                        options = bn.BinaryViewType.get_default_options()
-                        self._current_view = bn.BinaryViewType.get_view_of_file(
-                            canonical_path, file_metadata, options
-                        )
-                    else:
-                        self._current_view = bn.BinaryViewType.get_view_of_file(
-                            canonical_path, file_metadata
-                        )
-                except TypeError:
-                    self._current_view = bn.BinaryViewType.get_view_of_file(canonical_path)
-            else:
-                bn.log_info("Using legacy method")
-                file_metadata = bn.FileMetadata()
-                binary_view_type = bn.BinaryViewType.get_view_of_file_with_options(
-                    canonical_path, file_metadata
+            allowed_modes = {
+                "basic", "controlFlowGraph", "full", "intermediate", "linearSweep"
+            }
+            if analysis_mode not in allowed_modes:
+                raise ValueError(
+                    f"Unsupported analysis mode {analysis_mode!r}; expected one of "
+                    f"{', '.join(sorted(allowed_modes))}"
                 )
-                if binary_view_type:
-                    self._current_view = binary_view_type.open()
+
+            with self._load_lock:
+                existing = self._owned_views.get(canonical_path)
+                if existing is not None:
+                    self.current_view = existing
+                    return existing
+
+                if image_base is None:
+                    image_base = self._sidecar_image_base(canonical_path)
+                options: dict[str, object] = {"analysis.mode": analysis_mode}
+                if platform_name:
+                    options["loader.platform"] = platform_name
+                if image_base is not None:
+                    options["loader.imageBase"] = image_base
+
+                if hasattr(bn, "load"):
+                    bn.log_info(
+                        f"Opening {canonical_path} without blocking for analysis "
+                        f"(mode={analysis_mode}, platform={platform_name or 'auto'}, "
+                        f"base={hex(image_base) if image_base is not None else 'auto'})"
+                    )
+                    self._current_view = bn.load(
+                        canonical_path,
+                        update_analysis=False,
+                        options=options,
+                    )
                 else:
-                    raise Exception("No view type available for this file")
+                    raise RuntimeError(
+                        "This Binary Ninja version lacks the nonblocking bn.load API"
+                    )
 
-            if self._current_view is None:
-                raise RuntimeError(f"Binary Ninja could not create a view for: {canonical_path}")
+                if self._current_view is None:
+                    raise RuntimeError(
+                        f"Binary Ninja could not create a view for: {canonical_path}"
+                    )
 
-            loaded_view = self._current_view
-            self._owned_views[canonical_path] = loaded_view
-            self._register_view(loaded_view)
-            # _register_view prunes stale GUI views; on the very first load its
-            # initial prune may clear current_view before registering this one.
-            self._current_view = loaded_view
-            return loaded_view
+                loaded_view = self._current_view
+                self._owned_views[canonical_path] = loaded_view
+                self._register_view(loaded_view)
+                # _register_view prunes stale GUI views; on the very first load its
+                # initial prune may clear current_view before registering this one.
+                self._current_view = loaded_view
+                loaded_view.update_analysis()
+                return loaded_view
         except Exception as e:
             bn.log_error(f"Failed to load binary: {e}")
             raise

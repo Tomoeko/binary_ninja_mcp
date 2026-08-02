@@ -172,11 +172,21 @@ tool_timeout_sec = 120
 default_tools_approval_mode = "approve"
 ```
 
-After Codex restarts, use the `open_binary` MCP tool with an absolute path. A
-startup target can instead be supplied by appending `--binary`, followed by its
-path, to `args`. The `approve` mode trusts every tool exposed by this MCP server
-without per-call prompts; leave `enabled_tools` unset to expose the complete tool
-set.
+After Codex restarts, use the `open_binary` MCP tool with an absolute path.
+Opening creates and selects the view promptly, then runs conservative `basic`
+analysis in the background so large flat firmware images do not block the MCP
+transport. `get_binary_status` reports the active analysis state, function
+count, platform, and mapped range. An adjacent JSON file with a `base` or
+`image_base` field is applied automatically; `platform`, `image_base`, and
+`analysis_mode` can also be passed explicitly. Use `analysis_mode="full"` only
+when the additional analysis cost is intentional.
+
+A startup target can instead be supplied by appending `--binary`, followed by
+its path, to `args`. The launcher supervises both children and tears down the
+bridge if the Binary Ninja HTTP host exits, preventing a stale MCP process that
+accepts calls while no analysis service is listening. The `approve` mode trusts
+every tool exposed by this MCP server without per-call prompts; leave
+`enabled_tools` unset to expose the complete tool set.
 
 ## Usage
 

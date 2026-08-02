@@ -622,13 +622,28 @@ def get_binary_status() -> str:
 
 
 @mcp.tool()
-def open_binary(filepath: str) -> str:
-    """Open a local binary in the headless Binary Ninja service and select it."""
+def open_binary(
+    filepath: str,
+    analysis_mode: str = "basic",
+    platform: str = "",
+    image_base: str = "",
+) -> str:
+    """Open a binary promptly and start background Binary Ninja analysis.
+
+    Adjacent JSON metadata containing ``base`` is used automatically. Optional
+    platform/image_base values override loader auto-detection.
+    """
     try:
+        payload = {
+            "filepath": filepath,
+            "analysis_mode": analysis_mode,
+            "platform": platform,
+            "image_base": image_base,
+        }
         response = requests.post(
             f"{binja_server_url}/load",
-            json={"filepath": filepath},
-            timeout=120,
+            json=payload,
+            timeout=30,
         )
         try:
             data = response.json()

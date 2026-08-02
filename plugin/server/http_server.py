@@ -1,10 +1,11 @@
 import json
 import threading
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import binaryninja as bn
+from binaryninja.enums import AnalysisState
 from binaryninja.settings import Settings
 
 from ..api.endpoints import BinaryNinjaEndpoints
@@ -262,12 +263,27 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 limit = parse_int_or_default(params.get("limit"), 100)
 
             if path == "/status":
+                view = self.binary_ops.current_view if self.binary_ops else None
                 status = {
-                    "loaded": self.binary_ops and self.binary_ops.current_view is not None,
-                    "filename": self.binary_ops.current_view.file.filename
-                    if self.binary_ops and self.binary_ops.current_view
-                    else None,
+                    "loaded": view is not None,
+                    "filename": view.file.filename if view else None,
                 }
+                if view is not None:
+                    try:
+                        state = view.analysis_info.state
+                        status["analysis_state"] = AnalysisState(state).name
+                    except Exception:
+                        status["analysis_state"] = "unknown"
+                    try:
+                        status["function_count"] = len(view.functions)
+                    except Exception:
+                        status["function_count"] = None
+                    try:
+                        status["platform"] = view.platform.name if view.platform else None
+                        status["start"] = hex(view.start)
+                        status["end"] = hex(view.end)
+                    except Exception:
+                        pass
                 self._send_json_response(status)
 
             elif path == "/functions" or path == "/methods":
@@ -1928,9 +1944,30 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                     return
 
                 try:
-                    self.binary_ops.load_binary(filepath)
+                    analysis_mode = str(params.get("analysis_mode") or "basic")
+                    platform_name = params.get("platform") or None
+                    image_base_value = params.get("image_base")
+                    image_base = None
+                    if image_base_value not in (None, ""):
+                        image_base = int(str(image_base_value), 0)
+                    view = self.binary_ops.load_binary(
+                        filepath,
+                        analysis_mode=analysis_mode,
+                        platform_name=str(platform_name) if platform_name else None,
+                        image_base=image_base,
+                    )
                     self._send_json_response(
-                        {"success": True, "message": f"Binary loaded: {filepath}"}
+                        {
+                            "success": True,
+                            "message": (
+                                f"Binary opened: {view.file.filename}; "
+                                "background analysis started"
+                            ),
+                            "analysis_mode": analysis_mode,
+                            "platform": view.platform.name if view.platform else None,
+                            "start": hex(view.start),
+                            "end": hex(view.end),
+                        }
                     )
                 except Exception as e:
                     self._send_json_response({"error": str(e)}, 500)
@@ -2378,7 +2415,8 @@ class MCPServer:
             {"binary_ops": self.binary_ops},
         )
 
-        self.server = HTTPServer(server_address, handler_class)
+        self.server = ThreadingHTTPServer(server_address, handler_class)
+        self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.daemon = True
         self.thread.start()

@@ -99,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
         for path in args.binary:
             view = server.binary_ops.load_binary(path)
             print(
-                f"Loaded {view.file.filename} ({len(list(view.functions))} functions)",
+                f"Opened {view.file.filename}; background analysis started",
                 file=sys.stderr,
                 flush=True,
             )

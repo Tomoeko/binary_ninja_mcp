@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -71,6 +72,22 @@ class LauncherTests(unittest.TestCase):
             ["--binary", "/tmp/one", "--binary", "/tmp/two"]
         )
         self.assertEqual(args.binary, ["/tmp/one", "/tmp/two"])
+
+    def test_supervisor_stops_bridge_when_host_exits(self):
+        host = mock.Mock()
+        bridge = mock.Mock()
+        host.poll.return_value = -9
+        bridge.poll.return_value = None
+        with mock.patch.object(launcher, "stop_process") as stop:
+            self.assertEqual(launcher.supervise_processes(host, bridge), -9)
+            stop.assert_called_once_with(bridge)
+
+    def test_supervisor_returns_bridge_status(self):
+        host = mock.Mock()
+        bridge = mock.Mock()
+        host.poll.return_value = None
+        bridge.poll.return_value = 0
+        self.assertEqual(launcher.supervise_processes(host, bridge), 0)
 
 
 if __name__ == "__main__":

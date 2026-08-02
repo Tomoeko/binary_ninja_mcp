@@ -8,6 +8,7 @@ import json
 import select
 import socket
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -25,6 +26,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--python", default="python3.13")
     parser.add_argument("--binary", default=str(REPO_ROOT / "example/chal"))
+    parser.add_argument(
+        "--open-binary",
+        help="call the open_binary MCP tool for this path after startup",
+    )
     parser.add_argument(
         "--port",
         type=int,
@@ -110,6 +115,34 @@ def main() -> int:
     tools_response = request("tools/list", {})
     status = call_tool("get_binary_status")
 
+    opened_status = ""
+    open_elapsed = 0.0
+    if args.open_binary:
+        open_path = Path(args.open_binary).resolve()
+        started = time.monotonic()
+        opened = call_tool("open_binary", {"filepath": str(open_path)}, timeout=15)
+        open_elapsed = time.monotonic() - started
+        if "background analysis started" not in opened:
+            raise RuntimeError(f"open_binary returned an unexpected result: {opened}")
+        opened_status = call_tool("get_binary_status")
+        parsed_status = json.loads(opened_status)
+        if parsed_status.get("filename") != str(open_path):
+            raise RuntimeError(f"open_binary selected the wrong view: {opened_status}")
+
+        sidecar = open_path.with_suffix(".json")
+        if sidecar.is_file():
+            metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+            expected_base = metadata.get("base")
+            if expected_base is None:
+                expected_base = metadata.get("image_base")
+            if expected_base is not None:
+                expected_start = hex(int(str(expected_base), 0))
+                if parsed_status.get("start") != expected_start:
+                    raise RuntimeError(
+                        "open_binary ignored sidecar image base: "
+                        f"expected {expected_start}, got {parsed_status.get('start')}"
+                    )
+
     regression_results: dict[str, str] = {}
     if args.regressions:
         regression_results["list_platforms"] = call_tool("list_platforms")
@@ -186,6 +219,9 @@ def main() -> int:
     print(f"tool_count={len(tools)}")
     print("open_binary=True")
     print(f"status={status}")
+    if opened_status:
+        print(f"open_elapsed={open_elapsed:.3f}s")
+        print(f"opened_status={opened_status}")
     if regression_results:
         print(f"regressions={','.join(regression_results)}")
     return 0

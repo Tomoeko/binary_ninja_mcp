@@ -180,6 +180,29 @@ def stop_process(process: subprocess.Popen | None) -> None:
         process.wait(timeout=5)
 
 
+def supervise_processes(
+    host_process: subprocess.Popen,
+    bridge_process: subprocess.Popen,
+    poll_interval: float = 0.1,
+) -> int:
+    """Return when either child exits and never leave a dead-host bridge alive."""
+    while True:
+        host_status = host_process.poll()
+        bridge_status = bridge_process.poll()
+        if host_status is not None:
+            if bridge_status is None:
+                print(
+                    "Binary Ninja HTTP host exited while the MCP bridge was active "
+                    f"(exit={host_status}); stopping the bridge.",
+                    file=sys.stderr,
+                )
+                stop_process(bridge_process)
+            return host_status if host_status != 0 else 1
+        if bridge_status is not None:
+            return bridge_status
+        time.sleep(poll_interval)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     host_python = resolve_executable(args.python)
@@ -230,7 +253,7 @@ def main(argv: list[str] | None = None) -> int:
             stdout=sys.stdout,
             stderr=sys.stderr,
         )
-        return bridge_process.wait()
+        return supervise_processes(host_process, bridge_process)
     except KeyboardInterrupt:
         return 130
     except Exception as exc:

@@ -865,12 +865,20 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
 
   server.tool(
     "open_binary",
-    "Open a local binary in the Binary Ninja service and select it.",
+    "Open a local binary promptly and start background Binary Ninja analysis.",
     {
       filepath: z.string().describe("Absolute path to the binary on the MCP host"),
+      analysis_mode: z.string().default("basic").describe("Binary Ninja analysis mode"),
+      platform: z.string().default("").describe("Optional loader platform override"),
+      image_base: z.string().default("").describe("Optional image base override"),
     },
-    async ({ filepath }) => {
-      const result = await client.post("load", { filepath });
+    async ({ filepath, analysis_mode, platform, image_base }) => {
+      const result = await client.post("load", {
+        filepath,
+        analysis_mode,
+        platform,
+        image_base,
+      });
       return { content: [{ type: "text", text: result }] };
     }
   );
