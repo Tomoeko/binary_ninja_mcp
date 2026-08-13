@@ -72,11 +72,14 @@ python scripts/mcp_client_installer.py --uninstall  # remove entries and delete 
 python scripts/mcp_client_installer.py --config     # print a generic JSON config snippet
 ```
 
-For Codex, `--install` also installs the bundled Binary Ninja analysis skill at
-`${CODEX_HOME:-~/.codex}/skills/binary-ninja`. `--uninstall` removes only the
-files managed by this repository and preserves unrelated files in that skill
-directory. Start a new Codex task after installation so the skill catalog is
-refreshed.
+For Codex, `--install` installs both the bundled Binary Ninja analysis skill at
+`${CODEX_HOME:-~/.codex}/skills/binary-ninja` and a persistent headless
+`binary_ninja` MCP server entry through `codex mcp add`. Absolute paths are
+recorded for the Python interpreter, launcher, and bridge environment, so the
+server does not depend on Binary Ninja's GUI or the launching application's
+working directory. `--uninstall` removes only the files and server entry
+managed by this repository. Start a new Codex task after installation so the
+MCP tool catalog and skill catalog are refreshed.
 
 #### Using npm package (Recommended)
 
@@ -161,7 +164,8 @@ environment created by the installed Binary Ninja plugin. You can also select on
 export BINJA_MCP_BRIDGE_PYTHON="/absolute/path/to/.venv/bin/python"
 ```
 
-Add the launcher to Codex's MCP configuration:
+The installer performs the following Codex configuration automatically. For a
+manual installation, add the launcher to Codex's MCP configuration:
 
 ```toml
 [mcp_servers.binary_ninja]

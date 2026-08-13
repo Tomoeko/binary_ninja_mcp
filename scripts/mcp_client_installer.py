@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 
 # Import shared utilities
@@ -24,6 +25,7 @@ except ImportError:
 
 # Unique key used in MCP client configs
 MCP_SERVER_KEY = "binary_ninja_mcp"
+CODEX_MCP_SERVER_KEY = "binary_ninja"
 CODEX_SKILL_NAME = "binary-ninja"
 CODEX_SKILL_FILES = ("SKILL.md", os.path.join("agents", "openai.yaml"))
 
@@ -35,6 +37,10 @@ def _repo_root() -> str:
 
 def _bridge_entrypoint() -> str:
     return os.path.join(_repo_root(), "bridge", "binja_mcp_bridge.py")
+
+
+def _headless_entrypoint() -> str:
+    return os.path.join(_repo_root(), "scripts", "run_headless_mcp.py")
 
 
 def _venv_dir() -> str:
@@ -130,6 +136,130 @@ def install_codex_skill(
             status = "Already absent" if uninstall else "Already current"
         print(f"{status} Codex skill\n  Skill: {target}")
     return changed
+
+
+def _codex_executable() -> str | None:
+    override = os.environ.get("CODEX_CLI_PATH")
+    if override:
+        candidate = os.path.abspath(os.path.expanduser(override))
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which("codex")
+
+
+def _binary_ninja_python() -> str:
+    override = os.environ.get("BINJA_MCP_PYTHON")
+    if override:
+        candidate = os.path.abspath(os.path.expanduser(override))
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+        raise RuntimeError(
+            f"BINJA_MCP_PYTHON is not an executable file: {candidate}"
+        )
+
+    candidate = shutil.which("python3.13")
+    if candidate:
+        return os.path.abspath(candidate)
+    raise RuntimeError(
+        "Binary Ninja headless mode requires Python 3.13. Install it or set "
+        "BINJA_MCP_PYTHON to its absolute executable path."
+    )
+
+
+def _validate_codex_runtime(host_python: str, bridge_python: str) -> None:
+    checks = (
+        (
+            [host_python, _headless_entrypoint(), "--check"],
+            "Binary Ninja headless runtime",
+        ),
+        (
+            [
+                bridge_python,
+                "-c",
+                "import requests; import importlib.util; "
+                "assert (importlib.util.find_spec('mcp.server.fastmcp') or "
+                "importlib.util.find_spec('mcp.server.mcpserver'))",
+            ],
+            "MCP bridge runtime",
+        ),
+    )
+    for command, description in checks:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=90,
+            check=False,
+        )
+        if result.returncode == 0:
+            continue
+        output = "\n".join(
+            value.strip()
+            for value in (result.stdout, result.stderr)
+            if value.strip()
+        )
+        raise RuntimeError(
+            f"{description} validation failed (exit {result.returncode}): {output}"
+        )
+
+
+def install_codex_mcp_server(
+    *,
+    uninstall: bool = False,
+    quiet: bool = False,
+    codex_home: str | None = None,
+) -> bool:
+    """Install the restart-safe headless server in Codex's TOML configuration.
+
+    Use ``codex mcp`` instead of editing TOML directly. This keeps installation
+    compatible with Codex configuration schema changes and makes repeated
+    installs idempotently replace stale paths.
+    """
+    codex = _codex_executable()
+    if not codex:
+        if not quiet:
+            print("Skipping Codex MCP server: codex executable not found")
+        return False
+
+    command = [codex, "mcp", "remove" if uninstall else "add", CODEX_MCP_SERVER_KEY]
+    if not uninstall:
+        bridge_python = os.path.abspath(ensure_local_venv())
+        host_python = _binary_ninja_python()
+        _validate_codex_runtime(host_python, bridge_python)
+        command.extend(
+            [
+                "--",
+                host_python,
+                _headless_entrypoint(),
+                "--bridge-python",
+                bridge_python,
+            ]
+        )
+
+    environment = os.environ.copy()
+    if codex_home:
+        environment["CODEX_HOME"] = os.path.abspath(os.path.expanduser(codex_home))
+    result = subprocess.run(
+        command,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = "\n".join(
+        value.strip() for value in (result.stdout, result.stderr) if value.strip()
+    )
+    if result.returncode != 0:
+        if uninstall and "not found" in output.lower():
+            return False
+        raise RuntimeError(
+            f"Codex MCP configuration failed (exit {result.returncode}): {output}"
+        )
+
+    if not quiet:
+        action = "Uninstalled" if uninstall else "Installed"
+        print(f"{action} Codex MCP server\n  Server: {CODEX_MCP_SERVER_KEY}")
+    return True
 
 
 def ensure_local_venv() -> str:
@@ -376,6 +506,7 @@ def main():
 
     if args.uninstall:
         install_mcp_servers(uninstall=True, quiet=args.quiet)
+        install_codex_mcp_server(uninstall=True, quiet=args.quiet)
         install_codex_skill(uninstall=True, quiet=args.quiet)
         # Also remove auto-setup sentinel so the plugin can re-run setup later
         sentinel = os.path.join(_repo_root(), ".mcp_auto_setup_done")
@@ -393,6 +524,7 @@ def main():
     # Default action is install if no flag is provided
     if args.install or (not args.uninstall and not args.config):
         install_mcp_servers(quiet=args.quiet)
+        install_codex_mcp_server(quiet=args.quiet)
         install_codex_skill(quiet=args.quiet)
 
 
