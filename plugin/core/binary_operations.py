@@ -16,8 +16,13 @@ from .config import BinaryNinjaConfig
 
 
 class BinaryOperations:
-    def __init__(self, config: BinaryNinjaConfig):
+    def __init__(self, config: BinaryNinjaConfig, state_lock: Any | None = None):
         self.config = config
+        # The HTTP server passes its operation lock here. UI callbacks and HTTP
+        # requests then participate in the same critical section, so a view
+        # cannot be selected, closed, or registered halfway through an
+        # operation that reads Binary Ninja's mutable analysis state.
+        self._state_lock = state_lock or threading.RLock()
         self._current_view: bn.BinaryView | None = None
         # Multi-binary support
         # Store weak references so closed views are auto-pruned
@@ -31,19 +36,25 @@ class BinaryOperations:
 
     @property
     def current_view(self) -> bn.BinaryView | None:
-        return self._current_view
+        with self._state_lock:
+            return self._current_view
 
     @current_view.setter
     def current_view(self, bv: bn.BinaryView | None):
-        self._current_view = bv
-        if bv:
-            bn.log_info(f"Set current binary view: {bv.file.filename}")
-            try:
-                self._register_view(bv)
-            except Exception:
-                pass
-        else:
-            bn.log_info("Cleared current binary view")
+        with self._state_lock:
+            if bv:
+                try:
+                    self._register_view(bv)
+                except Exception:
+                    pass
+                # _register_view prunes stale views, including an unregistered
+                # candidate. Assign only after registration so the newly
+                # selected GUI view cannot be cleared during its own setter.
+                self._current_view = bv
+                bn.log_info(f"Set current binary view: {bv.file.filename}")
+            else:
+                self._current_view = None
+                bn.log_info("Cleared current binary view")
 
     @staticmethod
     def _sidecar_image_base(canonical_path: str) -> int | None:
@@ -98,7 +109,7 @@ class BinaryOperations:
                     f"{', '.join(sorted(allowed_modes))}"
                 )
 
-            with self._load_lock:
+            with self._load_lock, self._state_lock:
                 existing = self._owned_views.get(canonical_path)
                 if existing is not None:
                     self.current_view = existing
@@ -147,11 +158,12 @@ class BinaryOperations:
 
     def close_owned_views(self) -> None:
         """Close BinaryViews opened by this service and release their owners."""
-        views = list(self._owned_views.values())
-        self._owned_views.clear()
-        self._current_view = None
-        self._views_by_id.clear()
-        self._id_by_filename.clear()
+        with self._state_lock:
+            views = list(self._owned_views.values())
+            self._owned_views.clear()
+            self._current_view = None
+            self._views_by_id.clear()
+            self._id_by_filename.clear()
         for view in views:
             try:
                 view.file.close()
@@ -224,13 +236,18 @@ class BinaryOperations:
 
     def register_view(self, bv: bn.BinaryView) -> str:
         """Public wrapper to register a BinaryView and return its id."""
-        return self._register_view(bv)
+        with self._state_lock:
+            return self._register_view(bv)
 
     def unregister_by_filename(self, filename: str) -> int:
         """Remove all tracked views that match the given absolute filename.
 
         Returns number of entries removed.
         """
+        with self._state_lock:
+            return self._unregister_by_filename(filename)
+
+    def _unregister_by_filename(self, filename: str) -> int:
         if not filename:
             return 0
         self._prune_views()
@@ -267,6 +284,10 @@ class BinaryOperations:
 
         Note: Tracks binaries opened via this plugin or explicitly registered as current_view.
         """
+        with self._state_lock:
+            return self._list_open_binaries()
+
+    def _list_open_binaries(self) -> list[dict[str, str]]:
         items: list[dict[str, str]] = []
         # Cleanup first
         self._prune_views()
@@ -305,28 +326,36 @@ class BinaryOperations:
         return items
 
     def select_view(self, ident: str) -> dict[str, str] | None:
-        """Select active BinaryView by id or filename/basename.
+        """Select a view by namespaced id/ordinal or filename/basename.
 
         Returns selection info on success, None on failure.
         """
+        with self._state_lock:
+            return self._select_view(ident)
+
+    def _select_view(self, ident: str) -> dict[str, str] | None:
         s = (ident or "").strip()
         if not s:
             return None
         self._prune_views()
-        # Try id
-        w = self._views_by_id.get(s)
         vb = None
-        if w is not None:
+        # Numeric ids used to mean both an internal id and a sorted ordinal.
+        # Require a namespace so selecting a binary is deterministic even when
+        # load order differs from filename order.
+        if s.startswith("view:"):
+            view_id = s.removeprefix("view:").strip()
+            w = self._views_by_id.get(view_id)
+            if w is not None:
+                try:
+                    vb = w()
+                except Exception:
+                    vb = None
+        elif s.startswith("ordinal:"):
+            ordinal = s.removeprefix("ordinal:").strip()
             try:
-                vb = w()
-            except Exception:
-                vb = None
-        # If user passed a 1-based ordinal (from /binaries), map it to filename
-        if vb is None and s.isdigit():
-            try:
-                idx = int(s)
+                idx = int(ordinal)
                 if idx >= 1:
-                    lst = self.list_open_binaries()  # sorted order
+                    lst = self._list_open_binaries()  # sorted order
                     if 1 <= idx <= len(lst):
                         fname = lst[idx - 1].get("filename")
                         if fname:
@@ -336,6 +365,8 @@ class BinaryOperations:
                                 vb = wmap() if wmap else None
             except Exception:
                 vb = None
+        elif s.isdigit():
+            return None
         # Try direct filename mapping
         if vb is None:
             try:
@@ -347,8 +378,9 @@ class BinaryOperations:
             except Exception:
                 vb = None
         if vb is None:
-            # Try match by full filename or basename
-            for vid, w2 in self._views_by_id.items():
+            # Basenames are convenient but only deterministic when unique.
+            basename_matches = []
+            for _vid, w2 in self._views_by_id.items():
                 try:
                     v = w2()
                 except Exception:
@@ -363,9 +395,13 @@ class BinaryOperations:
                     continue
                 import os as _os
 
-                if s == fn or s == _os.path.basename(fn):
+                if s == fn:
                     vb = v
                     break
+                if s == _os.path.basename(fn):
+                    basename_matches.append(v)
+            if vb is None and len(basename_matches) == 1:
+                vb = basename_matches[0]
         if vb is None:
             return None
         self.current_view = vb
@@ -379,6 +415,11 @@ class BinaryOperations:
                 vid = k
                 break
         return {"id": vid or "", "filename": getattr(vb.file, "filename", "(unknown)")}
+
+    def managed_view_count(self) -> int:
+        """Return the number of live managed views under the shared state lock."""
+        with self._state_lock:
+            return len(self._list_open_binaries())
 
     def get_function_by_name_or_address(self, identifier: str | int) -> bn.Function | None:
         """Get a function by either its name or address.

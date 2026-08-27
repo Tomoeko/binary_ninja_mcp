@@ -1,6 +1,10 @@
+import base64
+import binascii
+import hmac
 import json
 import threading
 import urllib.parse
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -17,6 +21,19 @@ from ..utils.string_utils import parse_int_or_default
 
 class MCPRequestHandler(BaseHTTPRequestHandler):
     binary_ops = None  # Will be set by the server
+    operation_lock = None  # Serializes access to Binary Ninja's mutable analysis state
+    instance_id = None
+    auth_token = None
+    _target_free_paths = frozenset(
+        {
+            "/binaries",
+            "/views",
+            "/selectBinary",
+            "/load",
+            "/convertNumber",
+            "/platforms",
+        }
+    )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -237,8 +254,87 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _prepare_request(self) -> bool:
+        """Authenticate the caller and bind this request to an explicit view."""
+        expected_token = self.auth_token
+        if expected_token:
+            supplied_token = self.headers.get("X-Binary-Ninja-MCP-Token", "")
+            if not hmac.compare_digest(str(expected_token), supplied_token):
+                self._send_json_response({"error": "Unauthorized MCP request"}, 403)
+                return False
+
+        encoded_target = self.headers.get("X-Binary-Ninja-View-B64", "").strip()
+        if encoded_target:
+            try:
+                target = base64.b64decode(
+                    encoded_target,
+                    altchars=b"-_",
+                    validate=True,
+                ).decode("utf-8")
+            except (binascii.Error, UnicodeDecodeError):
+                self._send_json_response(
+                    {"error": "Invalid encoded Binary Ninja view selector"},
+                    400,
+                )
+                return False
+        else:
+            # Retain compatibility with older GUI/bridge clients. New bridges
+            # use the encoded header so Unicode filenames are always valid.
+            target = self.headers.get("X-Binary-Ninja-View", "").strip()
+        if target and (not self.binary_ops or not self.binary_ops.select_view(target)):
+            available = []
+            if self.binary_ops:
+                available = BinaryNinjaEndpoints(self.binary_ops).list_binaries().get(
+                    "binaries", []
+                )
+            self._send_json_response(
+                {
+                    "error": f"Binary not found: {target}",
+                    "available": available,
+                },
+                404,
+            )
+            return False
+        path = urllib.parse.urlparse(self.path).path
+        if (
+            not target
+            and self._requires_explicit_target(path)
+            and self.binary_ops
+            and self.binary_ops.managed_view_count() > 1
+        ):
+            self._send_json_response(
+                {
+                    "error": (
+                        "Explicit binary selector required because more than one "
+                        "binary is open"
+                    ),
+                    "help": (
+                        "Send X-Binary-Ninja-View with a view:N selector or an "
+                        "absolute filename"
+                    ),
+                },
+                409,
+            )
+            return False
+        return True
+
+    @classmethod
+    def _requires_explicit_target(cls, path: str) -> bool:
+        """Return whether a multi-view request must name its BinaryView."""
+        return path not in cls._target_free_paths
+
     def do_GET(self):
+        """Keep each parsed Binary Ninja operation atomic within this host."""
+        lock = self.operation_lock
+        if lock is None:
+            return self._do_GET()
+        with lock:
+            return self._do_GET()
+
+    def _do_GET(self):
         try:
+            if not self._prepare_request():
+                return
             # For all endpoints except /status, /convertNumber, /platforms, /binaries, /views, /selectBinary, check loaded
             if (
                 not (
@@ -265,6 +361,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             if path == "/status":
                 view = self.binary_ops.current_view if self.binary_ops else None
                 status = {
+                    "instance_id": self.instance_id,
                     "loaded": view is not None,
                     "filename": view.file.filename if view else None,
                 }
@@ -1926,7 +2023,17 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_POST(self):
+        """Serialize mutations and loads with all other Binary Ninja calls."""
+        lock = self.operation_lock
+        if lock is None:
+            return self._do_POST()
+        with lock:
+            return self._do_POST()
+
+    def _do_POST(self):
         try:
+            if not self._prepare_request():
+                return
             path = urllib.parse.urlparse(self.path).path
             # /load is the bootstrap endpoint for headless sessions, so it must
             # remain available before a BinaryView exists.
@@ -1956,6 +2063,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                         platform_name=str(platform_name) if platform_name else None,
                         image_base=image_base,
                     )
+                    view_id = self.binary_ops.register_view(view)
                     self._send_json_response(
                         {
                             "success": True,
@@ -1963,6 +2071,9 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                                 f"Binary opened: {view.file.filename}; "
                                 "background analysis started"
                             ),
+                            "filename": view.file.filename,
+                            "view_id": view_id,
+                            "view_selector": f"view:{view_id}",
                             "analysis_mode": analysis_mode,
                             "platform": view.platform.name if view.platform else None,
                             "start": hex(view.start),
@@ -2398,13 +2509,25 @@ class MCPServer:
     - Data inspection
     """
 
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+        *,
+        instance_id: str | None = None,
+        auth_token: str | None = None,
+    ):
         self.config = config
         self.server = None
         self.thread = None
-        self.binary_ops = BinaryOperations(config.binary_ninja)
+        self.instance_id = instance_id or uuid.uuid4().hex
+        self.auth_token = auth_token
+        self.operation_lock = threading.RLock()
+        self.binary_ops = BinaryOperations(
+            config.binary_ninja,
+            state_lock=self.operation_lock,
+        )
 
-    def start(self):
+    def start(self) -> tuple[str, int]:
         """Start the HTTP server in a background thread."""
         server_address = (self.config.server.host, self.config.server.port)
 
@@ -2412,24 +2535,38 @@ class MCPServer:
         handler_class = type(
             "MCPRequestHandlerWithOps",
             (MCPRequestHandler,),
-            {"binary_ops": self.binary_ops},
+            {
+                "binary_ops": self.binary_ops,
+                "operation_lock": self.operation_lock,
+                "instance_id": self.instance_id,
+                "auth_token": self.auth_token,
+            },
         )
 
         self.server = ThreadingHTTPServer(server_address, handler_class)
-        self.server.daemon_threads = True
+        # Wait for in-flight Binary Ninja calls before views are closed on stop.
+        self.server.daemon_threads = False
+        bound_host = str(self.server.server_address[0])
+        bound_port = int(self.server.server_address[1])
+        self.config.server.port = bound_port
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.daemon = True
         self.thread.start()
-        bn.log_info(f"Server started on {self.config.server.host}:{self.config.server.port}")
+        bn.log_info(f"Server started on {bound_host}:{bound_port}")
+        return bound_host, bound_port
 
     def stop(self):
         """Stop the HTTP server and clean up resources."""
         if self.server:
-            self.server.shutdown()
-            self.server.server_close()
+            server = self.server
+            server.shutdown()
+            # ThreadingMixIn.block_on_close joins all non-daemon request
+            # threads. No BinaryView state is cleared until this completes.
+            server.server_close()
             if self.thread:
                 self.thread.join()
-            # Clear references so callers can reliably detect stopped state
-            self.thread = None
-            self.server = None
+            with self.operation_lock:
+                # Clear references so callers can reliably detect stopped state.
+                self.thread = None
+                self.server = None
             bn.log_info("Server stopped")

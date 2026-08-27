@@ -29,8 +29,14 @@ class BinaryNinjaEndpoints:
 
     # -------- Multi-binary helpers --------
     def _format_binary_listing(self, raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Normalize binary listing entries with ordinal, view id, basename, and selectors."""
+        """Normalize entries with deterministic, non-overlapping selectors."""
         formatted: list[dict[str, Any]] = []
+        basename_counts: dict[str, int] = {}
+        for item in raw:
+            filename = item.get("filename")
+            basename = os.path.basename(filename) if filename else None
+            if basename:
+                basename_counts[basename] = basename_counts.get(basename, 0) + 1
         for ordinal, item in enumerate(raw, start=1):
             filename = item.get("filename")
             view_id = str(item.get("id") or "")
@@ -38,16 +44,18 @@ class BinaryNinjaEndpoints:
             entry: dict[str, Any] = {
                 "id": str(ordinal),
                 "view_id": view_id,
+                "ordinal_selector": f"ordinal:{ordinal}",
+                "view_selector": f"view:{view_id}" if view_id else None,
                 "filename": filename,
                 "basename": basename,
                 "active": bool(item.get("active")),
             }
             selectors: list[str] = []
             for candidate in (
-                entry["id"],
-                view_id,
+                entry["view_selector"],
+                entry["ordinal_selector"],
                 filename,
-                basename,
+                basename if basename and basename_counts.get(basename) == 1 else None,
             ):
                 if candidate and candidate not in selectors:
                     selectors.append(candidate)
@@ -56,16 +64,16 @@ class BinaryNinjaEndpoints:
         return formatted
 
     def list_binaries(self) -> dict[str, Any]:
-        """List managed/open binaries with sequential ids (1..N) and active flag.
+        """List managed/open binaries with namespaced selectors and active flag.
 
-        The server maintains internal keys for views; this endpoint presents
-        a user-friendly, 1-based index stable under sorting by filename.
+        Bare numbers are display fields only. Selectors use ``view:N`` and
+        ``ordinal:N`` so internal ids cannot collide with sorted ordinals.
         """
         raw = self.binary_ops.list_open_binaries()
         return {"binaries": self._format_binary_listing(raw)}
 
     def select_binary(self, ident: str) -> dict[str, Any]:
-        """Select active binary by id or filename/basename."""
+        """Select by ``view:N``, ``ordinal:N``, filename, or basename."""
         info = self.binary_ops.select_view(ident)
         if not info:
             return {
@@ -85,12 +93,15 @@ class BinaryNinjaEndpoints:
         if not selected_entry:
             basename = os.path.basename(filename) if filename else None
             selectors: list[str] = []
-            for candidate in (view_id, filename, basename):
+            view_selector = f"view:{view_id}" if view_id else None
+            for candidate in (view_selector, filename, basename):
                 if candidate and candidate not in selectors:
                     selectors.append(candidate)
             selected_entry = {
                 "id": None,
                 "view_id": view_id,
+                "ordinal_selector": None,
+                "view_selector": view_selector,
                 "filename": filename,
                 "basename": basename,
                 "active": True,

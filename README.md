@@ -81,6 +81,17 @@ working directory. `--uninstall` removes only the files and server entry
 managed by this repository. Start a new Codex task after installation so the
 MCP tool catalog and skill catalog are refreshed.
 
+The Codex headless launcher uses an authenticated, OS-assigned loopback port
+for each process, so concurrent Codex tasks cannot attach to one another's
+Binary Ninja host. Each host also receives private writable Binary Ninja user
+state so concurrent native-plugin initialization cannot corrupt the shared
+Plugin Manager status file. When agents share one MCP process, analysis tools
+accept a stable `binary="view:N"` selector or absolute filename; supply it on
+every target-dependent call instead of relying on the mutable `select_binary`
+state. Bare numeric selectors are rejected because internal ids and sorted
+ordinals can collide. With multiple binaries open, an unscoped
+target-dependent request fails closed rather than using another agent's view.
+
 #### Using npm package (Recommended)
 
 The recommended way to set up the MCP client is using the official npm package:
@@ -262,7 +273,7 @@ The following table lists the available MCP functions for use:
 | `make_function_at(address, platform)`                                | Create a function at an address. `platform` optional; use `default` to pick the BinaryView/platform default. |
 | `list_platforms()`                                                   | List all available platform names.                                                                           |
 | `list_binaries()`                                                    | List managed/open binaries with ids and active flag.                                                         |
-| `select_binary(view)`                                                | Select active binary by id or filename.                                                                      |
+| `select_binary(view)`                                                | Select by `view:N`, `ordinal:N`, full path, or an unambiguous basename.                                      |
 | `list_all_strings()`                                                 | List all strings (no pagination; aggregates all pages).                                                      |
 | `list_classes`                                                       | List all namespace/class names in the program.                                                               |
 | `list_data_items`                                                    | List defined data labels and their values.                                                                   |

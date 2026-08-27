@@ -89,8 +89,11 @@ class BinaryNinjaMCP:
                 return
             global _mcp_user_stopped
             _mcp_user_stopped = True
-            self.server.binary_ops.current_view = None
+            # Stop accepting work and drain every in-flight request before the
+            # selected view is cleared. BinaryOperations shares the server's
+            # operation lock, so UI callbacks cannot retarget a live request.
             self.server.stop()
+            self.server.binary_ops.current_view = None
             bn.log_info("Binary Ninja MCP Max plugin stopped successfully")
             _set_status_indicator(False)
             _show_popup("MCP Server Stopped", "Server has been stopped.")
@@ -603,7 +606,7 @@ try:
         def __init__(self):
             super().__init__()
             ui.UIContext.registerNotification(self)
-        
+
         def _get_active_bv(self):
             try:
                 ctx = ui.UIContext.activeContext()

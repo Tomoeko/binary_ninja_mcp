@@ -169,7 +169,13 @@ def _binary_ninja_python() -> str:
 def _validate_codex_runtime(host_python: str, bridge_python: str) -> None:
     checks = (
         (
-            [host_python, _headless_entrypoint(), "--check"],
+            [
+                host_python,
+                _headless_entrypoint(),
+                "--python",
+                host_python,
+                "--check",
+            ],
             "Binary Ninja headless runtime",
         ),
         (

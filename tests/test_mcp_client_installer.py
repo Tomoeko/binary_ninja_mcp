@@ -3,8 +3,8 @@ from __future__ import annotations
 import importlib.util
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -61,6 +61,29 @@ class CodexSkillInstallerTests(unittest.TestCase):
 
 
 class CodexMcpInstallerTests(unittest.TestCase):
+    def test_runtime_validation_uses_the_isolating_launcher(self):
+        successful = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(
+            installer.subprocess,
+            "run",
+            side_effect=[successful, successful],
+        ) as run:
+            installer._validate_codex_runtime(
+                "/opt/python3.13",
+                "/tmp/bridge/python",
+            )
+
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            [
+                "/opt/python3.13",
+                str(REPO_ROOT / "scripts" / "run_headless_mcp.py"),
+                "--python",
+                "/opt/python3.13",
+                "--check",
+            ],
+        )
+
     def test_install_uses_codex_cli_and_absolute_headless_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             codex_home = Path(directory) / "codex"

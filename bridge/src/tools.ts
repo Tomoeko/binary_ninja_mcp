@@ -2,11 +2,52 @@
  * MCP Tool definitions for Binary Ninja integration.
  */
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+  McpServer,
+  RegisteredTool,
+  ToolCallback,
+} from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { BinjaHttpClient } from "./client.js";
+import { BinjaHttpClient, withBinaryTarget } from "./client.js";
+
+const UNSCOPED_TOOL_NAMES = new Set([
+  "open_binary",
+  "list_binaries",
+  "select_binary",
+  "convert_number",
+  "list_platforms",
+]);
+
+const BINARY_SELECTOR_DESCRIPTION =
+  "Stable view:N selector or absolute filename. Supply this on every target-dependent call when agents may run concurrently.";
 
 export function registerTools(server: McpServer, client: BinjaHttpClient): void {
+  function tool<Args extends z.ZodRawShape>(
+    name: string,
+    description: string,
+    schema: Args,
+    callback: ToolCallback<Args>,
+  ): RegisteredTool {
+    if (UNSCOPED_TOOL_NAMES.has(name)) {
+      return server.tool(name, description, schema, callback);
+    }
+
+    const scopedSchema = {
+      ...schema,
+      binary: z.string().default("").describe(BINARY_SELECTOR_DESCRIPTION),
+    };
+    const scopedCallback = (async (
+      args: z.output<z.ZodObject<typeof scopedSchema>>,
+      extra: Parameters<ToolCallback<Args>>[1],
+    ) => {
+      const { binary, ...toolArgs } = args;
+      return withBinaryTarget(binary || "", () =>
+        callback(toolArgs as z.output<z.ZodObject<Args>>, extra),
+      );
+    }) as unknown as ToolCallback<typeof scopedSchema>;
+    return server.tool(name, description, scopedSchema, scopedCallback);
+  }
+
   // Helper function to get active filename
   async function getActiveFilename(): Promise<string> {
     const data = await client.getJson<{ filename?: string }>("status");
@@ -18,7 +59,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
 
   // ===== Function Analysis Tools =====
 
-  server.tool(
+  tool(
     "list_methods",
     "List all function names in the program with pagination.",
     {
@@ -34,7 +75,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "get_entry_points",
     "List entry point(s) of the loaded binary.",
     {},
@@ -53,7 +94,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "search_functions_by_name",
     "Search for functions whose name contains the given substring.",
     {
@@ -70,7 +111,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "decompile_function",
     "Decompile a specific function by name and return the decompiled C code.",
     {
@@ -90,7 +131,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "get_il",
     "Get IL for a function in the selected view (hlil, mlil, llil).",
     {
@@ -119,7 +160,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "fetch_disassembly",
     "Retrieve the disassembled code of a function as assembly mnemonic instructions.",
     {
@@ -141,7 +182,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
 
   // ===== Rename Tools =====
 
-  server.tool(
+  tool(
     "rename_function",
     "Rename a function by its current name. The configured prefix will be automatically prepended if not present.",
     {
@@ -154,7 +195,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "rename_single_variable",
     "Rename a variable in a function.",
     {
@@ -181,7 +222,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "rename_multi_variables",
     "Rename multiple local variables in one call.",
     {
@@ -232,7 +273,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "rename_data",
     "Rename a data label at the specified address.",
     {
@@ -247,7 +288,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
 
   // ===== Comment Tools =====
 
-  server.tool(
+  tool(
     "set_comment",
     "Set a comment at a specific address.",
     {
@@ -260,7 +301,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "get_comment",
     "Get the comment at a specific address.",
     {
@@ -272,7 +313,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "delete_comment",
     "Delete the comment at a specific address.",
     {
@@ -284,7 +325,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "set_function_comment",
     "Set a comment for a function.",
     {
@@ -297,7 +338,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "get_function_comment",
     "Get the comment for a function.",
     {
@@ -309,7 +350,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "delete_function_comment",
     "Delete the comment for a function.",
     {
@@ -323,7 +364,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
 
   // ===== Type Tools =====
 
-  server.tool(
+  tool(
     "define_types",
     "Define types from a C code string.",
     {
@@ -344,7 +385,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "list_local_types",
     "List all local types in the database (paginated).",
     {
@@ -362,7 +403,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "search_types",
     "Search local types whose name or declaration contains the substring.",
     {
@@ -382,7 +423,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "get_user_defined_type",
     "Retrieve definition of a user defined type (struct, enumeration, typedef, union).",
     {
@@ -394,7 +435,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "get_type_info",
     "Resolve a type name and return its declaration and details (kind, members, enum values).",
     {
@@ -412,7 +453,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "declare_c_type",
     "Create or update a local type from a C declaration.",
     {
@@ -435,7 +476,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "retype_variable",
     "Retype a variable in a function.",
     {
@@ -462,7 +503,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "set_local_variable_type",
     "Set a local variable's type.",
     {
@@ -492,7 +533,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
 
   // ===== Data Tools =====
 
-  server.tool(
+  tool(
     "list_data_items",
     "List defined data labels and their values with pagination.",
     {
@@ -505,7 +546,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "hexdump_address",
     "Hexdump data starting at an address.",
     {
@@ -522,7 +563,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "hexdump_data",
     "Hexdump a data symbol by name or address.",
     {
@@ -548,7 +589,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "get_data_decl",
     "Return a declaration-like string and hexdump for a data symbol.",
     {
@@ -588,7 +629,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
 
   // ===== Cross-Reference Tools =====
 
-  server.tool(
+  tool(
     "get_xrefs_to",
     "Get all cross references (code and data) to the given address.",
     {
@@ -600,7 +641,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "get_xrefs_to_field",
     "Get all cross references to a named struct field (member).",
     {
@@ -613,7 +654,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "get_xrefs_to_struct",
     "Get cross references/usages related to a struct name.",
     {
@@ -625,7 +666,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "get_xrefs_to_type",
     "Get xrefs/usages related to a struct or type name.",
     {
@@ -637,7 +678,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "get_xrefs_to_enum",
     "Get usages/xrefs of an enum by scanning for member values and matches.",
     {
@@ -649,7 +690,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "get_xrefs_to_union",
     "Get cross references/usages related to a union type by name.",
     {
@@ -663,7 +704,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
 
   // ===== Utility Tools =====
 
-  server.tool(
+  tool(
     "function_at",
     "Retrieve the name of the function the address belongs to.",
     {
@@ -675,7 +716,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "get_stack_frame_vars",
     "Get stack frame variable information for a function (names, offsets, sizes, types).",
     {
@@ -698,7 +739,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "list_classes",
     "List all namespace/class names in the program with pagination.",
     {
@@ -711,7 +752,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "list_namespaces",
     "List all non-global namespaces in the program with pagination.",
     {
@@ -724,7 +765,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "list_segments",
     "List all memory segments in the program with pagination.",
     {
@@ -737,7 +778,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "list_sections",
     "List sections in the program with pagination.",
     {
@@ -765,7 +806,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "list_imports",
     "List imported symbols in the program with pagination.",
     {
@@ -778,7 +819,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "list_exports",
     "List exported functions/symbols with pagination.",
     {
@@ -791,7 +832,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "list_strings",
     "List all strings in the database (paginated).",
     {
@@ -804,7 +845,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "list_strings_filter",
     "List matching strings in the database (paginated, filtered).",
     {
@@ -818,7 +859,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "list_all_strings",
     "List all strings in the database (aggregated across pages).",
     {
@@ -853,7 +894,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "get_binary_status",
     "Get the current status of the loaded binary.",
     {},
@@ -863,7 +904,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "open_binary",
     "Open a local binary promptly and start background Binary Ninja analysis.",
     {
@@ -883,7 +924,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "list_binaries",
     "List managed/open binaries known to the server with ids and active flag.",
     {},
@@ -898,27 +939,28 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
       const binaries = (data as { binaries?: Array<Record<string, unknown>> }).binaries || [];
       const lines = binaries.map((it) => {
         const vid = (it as { id?: number }).id;
-        const view_id = (it as { view_id?: number }).view_id;
+        const view_id = (it as { view_id?: string }).view_id;
+        const viewSelector = (it as { view_selector?: string }).view_selector || (view_id ? `view:${view_id}` : "");
         const fn = (it as { filename?: string }).filename;
         const basename = (it as { basename?: string }).basename || "";
-        const selectors = (it as { selectors?: number[] }).selectors || [];
+        const selectors = (it as { selectors?: string[] }).selectors || [];
         const active = (it as { active?: boolean }).active;
         const label = basename || fn || "(unknown)";
         const full = fn || "(no filename)";
         const selectorText = selectors.map(String).join(", ");
         const mark = active ? " *active*" : "";
-        const viewPart = view_id ? ` view=${view_id}` : "";
+        const viewPart = viewSelector ? ` ${viewSelector}` : "";
         return `${vid}. ${label}${viewPart}${mark}\n    path: ${full}\n    selectors: ${selectorText}`;
       });
       return { content: [{ type: "text", text: lines.join("\n") }] };
     }
   );
 
-  server.tool(
+  tool(
     "select_binary",
-    "Select which binary to analyze by ordinal, internal view id, full path, or basename.",
+    "Change the legacy/GUI active view by view:N, ordinal:N, full path, or an unambiguous basename; explicit binary selectors still scope analysis calls.",
     {
-      view: z.string().describe("Ordinal, view id, full path, or basename"),
+      view: z.string().describe("view:N, ordinal:N, full path, or unambiguous basename"),
     },
     async ({ view }) => {
       const data = await client.getJson<{ error?: string; selected?: Record<string, unknown> }>("selectBinary", { view });
@@ -931,13 +973,13 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
       const sel = (data as { selected?: Record<string, unknown> }).selected;
       if (sel) {
         const ordinal = (sel as { id?: number }).id || "?";
-        const view_id = (sel as { view_id?: number }).view_id;
+        const view_id = (sel as { view_id?: string }).view_id;
         const fn = (sel as { filename?: string }).filename || "";
         const basename = (sel as { basename?: string }).basename || "";
-        const selectors = (sel as { selectors?: number[] }).selectors || [];
+        const selectors = (sel as { selectors?: string[] }).selectors || [];
         const selectorText = selectors.map(String).join(", ");
         const displayName = basename || fn || "(unknown)";
-        const viewPart = view_id ? ` (view ${view_id})` : "";
+        const viewPart = view_id ? ` (view:${view_id})` : "";
         const pathPart = fn ? `\nFull path: ${fn}` : "";
         return { content: [{ type: "text", text: `Selected ${ordinal}: ${displayName}${viewPart}${pathPart}\nSelectors: ${selectorText}` }] };
       }
@@ -947,7 +989,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
 
   // ===== Binary Modification Tools =====
 
-  server.tool(
+  tool(
     "set_function_prototype",
     "Set a function's prototype by name or address.",
     {
@@ -976,7 +1018,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "make_function_at",
     "Create a function at the given address.",
     {
@@ -1005,7 +1047,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "list_platforms",
     "List all available platform names from Binary Ninja.",
     {},
@@ -1025,7 +1067,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "patch_bytes",
     "Patch bytes at a given address in the binary.",
     {
@@ -1083,7 +1125,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "format_value",
     "Convert and annotate a value at an address in Binary Ninja.",
     {
@@ -1097,7 +1139,7 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
     }
   );
 
-  server.tool(
+  tool(
     "convert_number",
     "Convert a number or string to multiple representations (hex/dec/bin, C literals).",
     {

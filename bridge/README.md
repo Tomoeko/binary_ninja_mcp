@@ -6,7 +6,9 @@ This is the TypeScript implementation of the Binary Ninja MCP bridge server. It 
 
 - **Standalone MCP Server**: Run independently with any MCP client
 - **50+ Tools**: Full access to Binary Ninja's reverse engineering capabilities
-- **Easy Configuration**: CLI options and environment variables for host/port
+- **Concurrent Targeting**: Per-tool `binary` selectors are isolated across agents
+- **Authenticated Transport**: Optional token on every HTTP verb
+- **Easy Configuration**: CLI options and environment variables for host/port/token
 - **TypeScript**: Full type safety and better developer experience
 
 ## Installation
@@ -43,6 +45,9 @@ npx -y binary-ninja-mcp
 # Connect to custom host/port
 npx -y binary-ninja-mcp --host 192.168.1.100 --port 9009
 
+# Connect to an authenticated host
+npx -y binary-ninja-mcp --host 127.0.0.1 --port 9009 --auth-token "$BINJA_MCP_AUTH_TOKEN"
+
 # Show help
 npx -y binary-ninja-mcp --help
 ```
@@ -50,9 +55,17 @@ npx -y binary-ninja-mcp --help
 ### Environment Variables
 
 ```bash
-# Set host and port via environment
-BINJA_MCP_HOST=localhost BINJA_MCP_PORT=9009 npx -y binary-ninja-mcp
+# Set host, port, and optional authentication via environment
+BINJA_MCP_HOST=localhost BINJA_MCP_PORT=9009 BINJA_MCP_AUTH_TOKEN=secret npx -y binary-ninja-mcp
 ```
+
+Every target-dependent tool accepts an optional `binary` argument. Pass the
+`view:N` selector returned by `open_binary`/`list_binaries`, or the absolute
+filename, on every call when tools or agents may run concurrently. Do not use
+`select_binary` as a concurrency boundary. Bare numeric selectors are
+intentionally ambiguous and rejected; `ordinal:N` is available for short-lived
+interactive selection. If multiple views exist, unscoped analysis requests
+fail closed.
 
 ### MCP Client Configuration
 

@@ -6,21 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import select
-import socket
 import subprocess
 import time
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
-
-
-def unused_loopback_port() -> int:
-    """Choose a currently unused loopback port for the isolated smoke host."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -34,7 +24,7 @@ def main() -> int:
         "--port",
         type=int,
         default=0,
-        help="isolated HTTP port (default: choose an unused loopback port)",
+        help="explicit HTTP port (default: launcher requests an atomic OS-assigned port)",
     )
     parser.add_argument(
         "--regressions",
@@ -42,18 +32,16 @@ def main() -> int:
         help="Exercise the MCP bridge regressions using the sieusb.ko fixture",
     )
     args = parser.parse_args()
-    port = args.port or unused_loopback_port()
-
     command = [
         args.python,
         str(REPO_ROOT / "scripts/run_headless_mcp.py"),
         "--binary",
         str(Path(args.binary).resolve()),
-        "--port",
-        str(port),
         "--startup-timeout",
         "30",
     ]
+    if args.port:
+        command.extend(["--port", str(args.port)])
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
@@ -73,7 +61,18 @@ def main() -> int:
         readable, _, _ = select.select([process.stdout], [], [], timeout)
         if not readable:
             raise TimeoutError(f"Timed out waiting for MCP response {message['id']}")
-        response = json.loads(process.stdout.readline())
+        line = process.stdout.readline()
+        if not line:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            diagnostics = process.stderr.read() if process.poll() is not None else ""
+            raise RuntimeError(
+                "MCP launcher closed stdout before replying "
+                f"(exit={process.poll()})\n{diagnostics[-5000:]}"
+            )
+        response = json.loads(line)
         responses.append(response)
         return response
 
@@ -116,6 +115,7 @@ def main() -> int:
     status = call_tool("get_binary_status")
 
     opened_status = ""
+    scoped_statuses: dict[str, str] = {}
     open_elapsed = 0.0
     if args.open_binary:
         open_path = Path(args.open_binary).resolve()
@@ -124,10 +124,21 @@ def main() -> int:
         open_elapsed = time.monotonic() - started
         if "background analysis started" not in opened:
             raise RuntimeError(f"open_binary returned an unexpected result: {opened}")
-        opened_status = call_tool("get_binary_status")
+        opened_status = call_tool(
+            "get_binary_status", {"binary": str(open_path)}
+        )
         parsed_status = json.loads(opened_status)
         if parsed_status.get("filename") != str(open_path):
             raise RuntimeError(f"open_binary selected the wrong view: {opened_status}")
+
+        for target in (Path(args.binary).resolve(), open_path):
+            scoped = call_tool("get_binary_status", {"binary": str(target)})
+            scoped_statuses[str(target)] = scoped
+            parsed_scoped = json.loads(scoped)
+            if parsed_scoped.get("filename") != str(target):
+                raise RuntimeError(
+                    f"explicit binary selector targeted the wrong view: {scoped}"
+                )
 
         sidecar = open_path.with_suffix(".json")
         if sidecar.is_file():
@@ -215,6 +226,16 @@ def main() -> int:
     tools = tools_response["result"]["tools"]
     if not any(tool["name"] == "open_binary" for tool in tools):
         raise RuntimeError("open_binary was not advertised by tools/list")
+    decompile_schema = next(
+        tool["inputSchema"] for tool in tools if tool["name"] == "decompile_function"
+    )
+    if "binary" not in decompile_schema.get("properties", {}):
+        raise RuntimeError("analysis tools do not expose an explicit binary selector")
+    status_schema = next(
+        tool["inputSchema"] for tool in tools if tool["name"] == "get_binary_status"
+    )
+    if "binary" not in status_schema.get("properties", {}):
+        raise RuntimeError("get_binary_status does not expose an explicit binary selector")
     print(f"responses={len(responses)}")
     print(f"tool_count={len(tools)}")
     print("open_binary=True")
@@ -222,6 +243,7 @@ def main() -> int:
     if opened_status:
         print(f"open_elapsed={open_elapsed:.3f}s")
         print(f"opened_status={opened_status}")
+        print(f"scoped_targets={','.join(scoped_statuses)}")
     if regression_results:
         print(f"regressions={','.join(regression_results)}")
     return 0

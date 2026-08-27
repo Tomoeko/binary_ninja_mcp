@@ -17,6 +17,7 @@
         "build": "tsc",
         "start": "node dist/index.js",
         "dev": "tsx src/index.ts",
+        "test": "tsx --test tests/targeting.test.ts",
         "typecheck": "tsc --noEmit"
     },
     "keywords": [

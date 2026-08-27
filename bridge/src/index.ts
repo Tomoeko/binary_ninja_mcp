@@ -12,11 +12,13 @@
  * Options:
  *   --host <host>     Binary Ninja MCP server host (default: localhost)
  *   --port <port>     Binary Ninja MCP server port (default: 9009)
+ *   --auth-token <t>  Optional HTTP authentication token
  *   --help            Show this help message
  * 
  * Environment variables:
  *   BINJA_MCP_HOST    Binary Ninja MCP server host
  *   BINJA_MCP_PORT    Binary Ninja MCP server port
+ *   BINJA_MCP_AUTH_TOKEN  Optional HTTP authentication token
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -25,10 +27,11 @@ import { createClient } from "./client.js";
 import { registerTools } from "./tools.js";
 
 // Parse command line arguments
-function parseArgs(): { host: string; port: number } {
+function parseArgs(): { host: string; port: number; authToken: string } {
   const args = process.argv.slice(2);
   let host = "localhost";
   let port = 9009;
+  let authToken = "";
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -43,6 +46,11 @@ function parseArgs(): { host: string; port: number } {
           port = parseInt(args[++i], 10);
         }
         break;
+      case "--auth-token":
+        if (i + 1 < args.length) {
+          authToken = args[++i];
+        }
+        break;
       case "--help":
       case "-h":
         console.log(`Binary Ninja MCP Server
@@ -52,11 +60,13 @@ Usage: npx binary-ninja-mcp [options]
 Options:
   --host <host>     Binary Ninja MCP server host (default: localhost)
   --port <port>     Binary Ninja MCP server port (default: 9009)
+  --auth-token <t>  Optional HTTP authentication token
   --help, -h        Show this help message
 
 Environment variables:
   BINJA_MCP_HOST    Binary Ninja MCP server host
   BINJA_MCP_PORT    Binary Ninja MCP server port
+  BINJA_MCP_AUTH_TOKEN  Optional HTTP authentication token
 `);
         process.exit(0);
         break;
@@ -70,13 +80,16 @@ Environment variables:
   if (process.env.BINJA_MCP_PORT) {
     port = parseInt(process.env.BINJA_MCP_PORT, 10) || port;
   }
+  if (process.env.BINJA_MCP_AUTH_TOKEN) {
+    authToken = process.env.BINJA_MCP_AUTH_TOKEN;
+  }
 
-  return { host, port };
+  return { host, port, authToken };
 }
 
 // Main entry point
 async function main(): Promise<void> {
-  const { host, port } = parseArgs();
+  const { host, port, authToken } = parseArgs();
 
   console.error(`Binary Ninja MCP Server connecting to ${host}:${port}`);
 
@@ -87,7 +100,7 @@ async function main(): Promise<void> {
   });
 
   // Create HTTP client for Binary Ninja
-  const client = createClient(host, port);
+  const client = createClient(host, port, authToken);
 
   // Register all tools
   registerTools(server, client);

@@ -2,22 +2,60 @@
  * HTTP client for communicating with the Binary Ninja MCP server.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import axios, { AxiosInstance, AxiosResponse } from "axios";
 
 export interface BinjaServerConfig {
   host: string;
   port: number;
+  authToken?: string;
+}
+
+interface BinjaRequestScope {
+  binary: string;
+}
+
+const requestScope = new AsyncLocalStorage<BinjaRequestScope>();
+
+/** Run one tool invocation with an immutable, async-local binary selector. */
+export function withBinaryTarget<T>(binary: string, operation: () => T): T {
+  const target = binary.trim();
+  if (!target) {
+    return operation();
+  }
+  return requestScope.run({ binary: target }, operation);
+}
+
+/** Build the headers shared by every HTTP verb for the current tool invocation. */
+export function buildRequestHeaders(authToken: string = ""): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (authToken) {
+    headers["X-Binary-Ninja-MCP-Token"] = authToken;
+  }
+  const binary = requestScope.getStore()?.binary;
+  if (binary) {
+    headers["X-Binary-Ninja-View-B64"] = Buffer.from(binary, "utf8").toString("base64");
+  }
+  return headers;
 }
 
 export class BinjaHttpClient {
   private client: AxiosInstance;
   private baseUrl: string;
+  private authToken: string;
 
   constructor(config: BinjaServerConfig) {
     this.baseUrl = `http://${config.host}:${config.port}`;
+    this.authToken = config.authToken || "";
     this.client = axios.create({
       baseURL: this.baseUrl,
-      timeout: 30000, // 30 seconds
+      // Local authenticated traffic must never inherit HTTP_PROXY/ALL_PROXY.
+      proxy: false,
+      // A timed-out mutating request may remain queued in the host and execute
+      // later. Wait for the authoritative response unless a caller supplies a
+      // timeout for a known read-only operation.
+      timeout: 0,
     });
   }
 
@@ -27,6 +65,7 @@ export class BinjaHttpClient {
   async getText(endpoint: string, params: Record<string, string | number> = {}, timeout?: number): Promise<string> {
     try {
       const response = await this.client.get(endpoint, {
+        headers: buildRequestHeaders(this.authToken),
         params,
         timeout,
         responseType: "text",
@@ -46,6 +85,7 @@ export class BinjaHttpClient {
   async getJson<T = unknown>(endpoint: string, params: Record<string, string | number> = {}, timeout?: number): Promise<T | { error: string }> {
     try {
       const response = await this.client.get(endpoint, {
+        headers: buildRequestHeaders(this.authToken),
         params,
         timeout,
       });
@@ -80,11 +120,15 @@ export class BinjaHttpClient {
       let response: AxiosResponse<string>;
       if (typeof data === "string") {
         response = await this.client.post(endpoint, data, {
-          headers: { "Content-Type": "text/plain" },
+          headers: {
+            ...buildRequestHeaders(this.authToken),
+            "Content-Type": "text/plain",
+          },
           responseType: "text",
         });
       } else {
         response = await this.client.post(endpoint, data, {
+          headers: buildRequestHeaders(this.authToken),
           responseType: "text",
         });
       }
@@ -103,6 +147,7 @@ export class BinjaHttpClient {
   async delete(endpoint: string, params: Record<string, string | number> = {}): Promise<string> {
     try {
       const response = await this.client.delete<string>(endpoint, {
+        headers: buildRequestHeaders(this.authToken),
         params,
         responseType: "text",
       });
@@ -134,6 +179,10 @@ export class BinjaHttpClient {
   }
 }
 
-export function createClient(host: string = "localhost", port: number = 9009): BinjaHttpClient {
-  return new BinjaHttpClient({ host, port });
+export function createClient(
+  host: string = "localhost",
+  port: number = 9009,
+  authToken: string = "",
+): BinjaHttpClient {
+  return new BinjaHttpClient({ host, port, authToken });
 }

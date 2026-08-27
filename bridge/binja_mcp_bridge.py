@@ -10,8 +10,15 @@ def _bridge_excepthook(exc_type, exc, tb):
 
 _sys.excepthook = _bridge_excepthook
 
-import requests
+import base64 as _base64
+import contextvars as _contextvars
+import functools as _functools
+import inspect as _inspect
 import os as _os
+import threading as _threading
+import time as _time
+
+import requests
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -22,8 +29,155 @@ except ModuleNotFoundError:
 
 _binja_host = _os.environ.get("BINJA_MCP_HOST", "localhost")
 _binja_port = _os.environ.get("BINJA_MCP_PORT", "9009")
+_binja_auth_token = _os.environ.get("BINJA_MCP_AUTH_TOKEN", "")
 binja_server_url = f"http://{_binja_host}:{_binja_port}"
 mcp = FastMCP("binja-mcp")
+_target_binary = _contextvars.ContextVar("binary_ninja_mcp_target", default="")
+_http = requests.Session()
+# Authenticated loopback traffic must not inherit HTTP_PROXY/ALL_PROXY.
+_http.trust_env = False
+_mutating_get_endpoints = frozenset(
+    {
+        "declareCType",
+        "defineTypes",
+        "formatValue",
+        "makeFunctionAt",
+        "patch",
+        "renameVariable",
+        "renameVariables",
+        "retypeVariable",
+        "setFunctionPrototype",
+        "setLocalVariableType",
+    }
+)
+
+
+def _effective_timeout(endpoint: str, requested: float | None) -> float | None:
+    """Never abandon a queued mutation that may execute after a timeout."""
+    if endpoint.strip("/") in _mutating_get_endpoints:
+        return None
+    return requested
+
+
+def _request_headers() -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if _binja_auth_token:
+        headers["X-Binary-Ninja-MCP-Token"] = _binja_auth_token
+    target = _target_binary.get().strip()
+    if target:
+        # HTTP header values are Latin-1 and reject newlines. Base64url keeps
+        # every valid Unicode path/selector representable and header-safe.
+        headers["X-Binary-Ninja-View-B64"] = _base64.urlsafe_b64encode(
+            target.encode("utf-8")
+        ).decode("ascii")
+    return headers
+
+
+_raw_mcp_tool = mcp.tool
+_unscoped_tool_names = {
+    "convert_number",
+    "list_binaries",
+    "list_platforms",
+    "open_binary",
+    "select_binary",
+}
+
+
+def scoped_tool(*decorator_args, **decorator_kwargs):
+    """Add an optional immutable binary selector to every analysis tool.
+
+    Codex can multiplex several agents through one stdio MCP connection, so a
+    prior ``select_binary`` call is not a safe session boundary. The selector
+    becomes an HTTP header on every request made by this tool invocation.
+    """
+    register = _raw_mcp_tool(*decorator_args, **decorator_kwargs)
+
+    def decorate(function):
+        if function.__name__ in _unscoped_tool_names:
+            return register(function)
+
+        signature = _inspect.signature(function)
+        binary_parameter = _inspect.Parameter(
+            "binary",
+            kind=_inspect.Parameter.KEYWORD_ONLY,
+            default="",
+            annotation=str,
+        )
+
+        @_functools.wraps(function)
+        def scoped(*args, binary: str = "", **kwargs):
+            reset_token = None
+            if binary.strip():
+                reset_token = _target_binary.set(binary.strip())
+            try:
+                return function(*args, **kwargs)
+            finally:
+                if reset_token is not None:
+                    _target_binary.reset(reset_token)
+
+        scoped.__signature__ = signature.replace(  # type: ignore[attr-defined]
+            parameters=[*signature.parameters.values(), binary_parameter]
+        )
+        scope_help = (
+            "\n\nbinary: Stable view:N selector or absolute filename. Supply this on every "
+            "target-dependent call when agents may run concurrently."
+        )
+        scoped.__doc__ = (function.__doc__ or "") + scope_help
+        return register(scoped)
+
+    return decorate
+
+
+def _exit_when_parent_dies(parent_pid: int) -> None:
+    """Ensure an abruptly killed launcher cannot orphan the stdio bridge."""
+    if _sys.platform == "win32":
+        import ctypes as _ctypes
+        from ctypes import wintypes as _wintypes
+
+        synchronize = 0x00100000
+        wait_timeout = 0x00000102
+        kernel32 = _ctypes.windll.kernel32
+        kernel32.OpenProcess.argtypes = [
+            _wintypes.DWORD,
+            _wintypes.BOOL,
+            _wintypes.DWORD,
+        ]
+        kernel32.OpenProcess.restype = _wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [_wintypes.HANDLE, _wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = _wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [_wintypes.HANDLE]
+        kernel32.CloseHandle.restype = _wintypes.BOOL
+        handle = kernel32.OpenProcess(synchronize, False, parent_pid)
+        if not handle:
+            _os._exit(1)
+        try:
+            while kernel32.WaitForSingleObject(handle, 1000) == wait_timeout:
+                pass
+        finally:
+            kernel32.CloseHandle(handle)
+        _os._exit(1)
+
+    while _os.getppid() == parent_pid:
+        _time.sleep(0.5)
+    _os._exit(1)
+
+
+def _start_parent_watchdog() -> None:
+    value = _os.environ.get("BINJA_MCP_PARENT_PID", "").strip()
+    if not value:
+        return
+    try:
+        parent_pid = int(value)
+    except ValueError:
+        raise RuntimeError("BINJA_MCP_PARENT_PID must be an integer")
+    if parent_pid <= 0:
+        raise RuntimeError("BINJA_MCP_PARENT_PID must be positive")
+    _threading.Thread(
+        target=_exit_when_parent_dies,
+        args=(parent_pid,),
+        daemon=True,
+        name="binary-ninja-mcp-launcher-watch",
+    ).start()
 
 
 def _active_filename() -> str:
@@ -43,17 +197,19 @@ def safe_get(endpoint: str, params: dict | None = None, timeout: float | None = 
     """
     if params is None:
         params = {}
-    qs = [f"{k}={v}" for k, v in params.items()]
-    query_string = "&".join(qs)
+    timeout = _effective_timeout(endpoint, timeout)
     url = f"{binja_server_url}/{endpoint}"
-    if query_string:
-        url += "?" + query_string
 
     try:
         if timeout is None:
-            response = requests.get(url)
+            response = _http.get(url, params=params, headers=_request_headers())
         else:
-            response = requests.get(url, timeout=timeout)
+            response = _http.get(
+                url,
+                params=params,
+                headers=_request_headers(),
+                timeout=timeout,
+            )
         response.encoding = "utf-8"
         if response.ok:
             return response.text.splitlines()
@@ -72,16 +228,18 @@ def get_json(endpoint: str, params: dict | None = None, timeout: float | None = 
     """
     if params is None:
         params = {}
-    qs = [f"{k}={v}" for k, v in params.items()]
-    query_string = "&".join(qs)
+    timeout = _effective_timeout(endpoint, timeout)
     url = f"{binja_server_url}/{endpoint}"
-    if query_string:
-        url += "?" + query_string
     try:
         if timeout is None:
-            response = requests.get(url)
+            response = _http.get(url, params=params, headers=_request_headers())
         else:
-            response = requests.get(url, timeout=timeout)
+            response = _http.get(
+                url,
+                params=params,
+                headers=_request_headers(),
+                timeout=timeout,
+            )
         response.encoding = "utf-8"
         # Try to parse JSON regardless of status
         try:
@@ -107,16 +265,18 @@ def get_text(endpoint: str, params: dict | None = None, timeout: float | None = 
     """Perform a GET and return raw text (or an error string)."""
     if params is None:
         params = {}
-    qs = [f"{k}={v}" for k, v in params.items()]
-    query_string = "&".join(qs)
+    timeout = _effective_timeout(endpoint, timeout)
     url = f"{binja_server_url}/{endpoint}"
-    if query_string:
-        url += "?" + query_string
     try:
         if timeout is None:
-            response = requests.get(url)
+            response = _http.get(url, params=params, headers=_request_headers())
         else:
-            response = requests.get(url, timeout=timeout)
+            response = _http.get(
+                url,
+                params=params,
+                headers=_request_headers(),
+                timeout=timeout,
+            )
         response.encoding = "utf-8"
         if response.ok:
             return response.text
@@ -129,10 +289,16 @@ def get_text(endpoint: str, params: dict | None = None, timeout: float | None = 
 def safe_post(endpoint: str, data: dict | str) -> str:
     try:
         if isinstance(data, dict):
-            response = requests.post(f"{binja_server_url}/{endpoint}", data=data, timeout=5)
+            response = _http.post(
+                f"{binja_server_url}/{endpoint}",
+                data=data,
+                headers=_request_headers(),
+            )
         else:
-            response = requests.post(
-                f"{binja_server_url}/{endpoint}", data=data.encode("utf-8"), timeout=5
+            response = _http.post(
+                f"{binja_server_url}/{endpoint}",
+                data=data.encode("utf-8"),
+                headers=_request_headers(),
             )
         response.encoding = "utf-8"
         if response.ok:
@@ -146,8 +312,10 @@ def safe_post(endpoint: str, data: dict | str) -> str:
 def safe_delete(endpoint: str, params: dict | None = None) -> str:
     """Perform a DELETE request and return raw text (or an error string)."""
     try:
-        response = requests.delete(
-            f"{binja_server_url}/{endpoint}", params=params or {}, timeout=5
+        response = _http.delete(
+            f"{binja_server_url}/{endpoint}",
+            params=params or {},
+            headers=_request_headers(),
         )
         response.encoding = "utf-8"
         if response.ok:
@@ -157,7 +325,7 @@ def safe_delete(endpoint: str, params: dict | None = None) -> str:
         return f"Request failed: {e!s}"
 
 
-@mcp.tool()
+@scoped_tool()
 def list_methods(offset: int = 0, limit: int = 100) -> list:
     """
     List all function names in the program with pagination.
@@ -167,7 +335,7 @@ def list_methods(offset: int = 0, limit: int = 100) -> list:
     return [header] + (body or [])
 
 
-@mcp.tool()
+@scoped_tool()
 def get_entry_points() -> list:
     """
     List entry point(s) of the loaded binary.
@@ -183,7 +351,7 @@ def get_entry_points() -> list:
     return out
 
 
-@mcp.tool()
+@scoped_tool()
 def retype_variable(function_name: str, variable_name: str, type_str: str) -> str:
     """
     Retype a variable in a function.
@@ -195,6 +363,7 @@ def retype_variable(function_name: str, variable_name: str, type_str: str) -> st
             "variableName": variable_name,
             "type": type_str,
         },
+        timeout=None,
     )
     if not data:
         return "Error: no response"
@@ -205,7 +374,7 @@ def retype_variable(function_name: str, variable_name: str, type_str: str) -> st
     return str(data)
 
 
-@mcp.tool()
+@scoped_tool()
 def rename_single_variable(function_name: str, variable_name: str, new_name: str) -> str:
     """
     Rename a variable in a function.
@@ -217,6 +386,7 @@ def rename_single_variable(function_name: str, variable_name: str, new_name: str
             "variableName": variable_name,
             "newName": new_name,
         },
+        timeout=None,
     )
     if not data:
         return "Error: no response"
@@ -227,7 +397,7 @@ def rename_single_variable(function_name: str, variable_name: str, new_name: str
     return str(data)
 
 
-@mcp.tool()
+@scoped_tool()
 def rename_multi_variables(
     function_identifier: str,
     mapping_json: str = "",
@@ -266,7 +436,7 @@ def rename_multi_variables(
     else:
         return "Error: provide mapping_json, renames_json, or pairs"
 
-    data = get_json("renameVariables", params)
+    data = get_json("renameVariables", params, timeout=None)
     if not data:
         return "Error: no response"
     if isinstance(data, dict) and data.get("error"):
@@ -279,12 +449,12 @@ def rename_multi_variables(
         return str(data)
 
 
-@mcp.tool()
+@scoped_tool()
 def define_types(c_code: str) -> str:
     """
     Define types from a C code string.
     """
-    data = get_json("defineTypes", {"cCode": c_code})
+    data = get_json("defineTypes", {"cCode": c_code}, timeout=None)
     if not data:
         return "Error: no response"
     # Expect a list of defined type names or a dict; normalize to string
@@ -295,7 +465,7 @@ def define_types(c_code: str) -> str:
     return str(data)
 
 
-@mcp.tool()
+@scoped_tool()
 def list_classes(offset: int = 0, limit: int = 100) -> list:
     """
     List all namespace/class names in the program with pagination.
@@ -303,7 +473,7 @@ def list_classes(offset: int = 0, limit: int = 100) -> list:
     return safe_get("classes", {"offset": offset, "limit": limit})
 
 
-@mcp.tool()
+@scoped_tool()
 def hexdump_address(address: str, length: int = -1) -> str:
     """
     Hexdump data starting at an address. When length < 0, reads the exact defined size if available.
@@ -314,7 +484,7 @@ def hexdump_address(address: str, length: int = -1) -> str:
     return get_text("hexdump", params, timeout=None)
 
 
-@mcp.tool()
+@scoped_tool()
 def hexdump_data(name_or_address: str, length: int = -1) -> str:
     """
     Hexdump a data symbol by name or address. When length < 0, reads the exact defined size if available.
@@ -325,7 +495,7 @@ def hexdump_data(name_or_address: str, length: int = -1) -> str:
     return get_text("hexdumpByName", {"name": ident, "length": length}, timeout=None)
 
 
-@mcp.tool()
+@scoped_tool()
 def get_data_decl(name_or_address: str, length: int = -1) -> str:
     """
     Return a declaration-like string and a hexdump for a data symbol by name or address.
@@ -347,7 +517,7 @@ def get_data_decl(name_or_address: str, length: int = -1) -> str:
     return f"Declaration ({addr} {name}):\n{decl}\n\nHexdump:\n{hexdump}"
 
 
-@mcp.tool()
+@scoped_tool()
 def decompile_function(name: str) -> str:
     """
     Decompile a specific function by name and return the decompiled C code.
@@ -363,7 +533,7 @@ def decompile_function(name: str) -> str:
     return file_line + str(data)
 
 
-@mcp.tool()
+@scoped_tool()
 def get_il(name_or_address: str, view: str = "hlil", ssa: bool = False) -> str:
     """
     Get IL for a function in the selected view.
@@ -389,7 +559,7 @@ def get_il(name_or_address: str, view: str = "hlil", ssa: bool = False) -> str:
     return file_line + str(data)
 
 
-@mcp.tool()
+@scoped_tool()
 def fetch_disassembly(name: str) -> str:
     """
     Retrive the disassembled code of a function with a given name as assemby mnemonic instructions.
@@ -405,7 +575,7 @@ def fetch_disassembly(name: str) -> str:
     return file_line + str(data)
 
 
-@mcp.tool()
+@scoped_tool()
 def rename_function(old_name: str, new_name: str) -> str:
     """
     Rename a function by its current name to a new user-defined name.
@@ -414,7 +584,7 @@ def rename_function(old_name: str, new_name: str) -> str:
     return safe_post("renameFunction", {"oldName": old_name, "newName": new_name})
 
 
-@mcp.tool()
+@scoped_tool()
 def rename_data(address: str, new_name: str) -> str:
     """
     Rename a data label at the specified address.
@@ -422,7 +592,7 @@ def rename_data(address: str, new_name: str) -> str:
     return safe_post("renameData", {"address": address, "newName": new_name})
 
 
-@mcp.tool()
+@scoped_tool()
 def set_comment(address: str, comment: str) -> str:
     """
     Set a comment at a specific address.
@@ -430,7 +600,7 @@ def set_comment(address: str, comment: str) -> str:
     return safe_post("comment", {"address": address, "comment": comment})
 
 
-@mcp.tool()
+@scoped_tool()
 def set_function_comment(function_name: str, comment: str) -> str:
     """
     Set a comment for a function.
@@ -438,7 +608,7 @@ def set_function_comment(function_name: str, comment: str) -> str:
     return safe_post("comment/function", {"name": function_name, "comment": comment})
 
 
-@mcp.tool()
+@scoped_tool()
 def get_comment(address: str) -> str:
     """
     Get the comment at a specific address.
@@ -446,7 +616,7 @@ def get_comment(address: str) -> str:
     return safe_get("comment", {"address": address})[0]
 
 
-@mcp.tool()
+@scoped_tool()
 def get_function_comment(function_name: str) -> str:
     """
     Get the comment for a function.
@@ -454,7 +624,7 @@ def get_function_comment(function_name: str) -> str:
     return safe_get("comment/function", {"name": function_name})[0]
 
 
-@mcp.tool()
+@scoped_tool()
 def list_segments(offset: int = 0, limit: int = 100) -> list:
     """
     List all memory segments in the program with pagination.
@@ -462,7 +632,7 @@ def list_segments(offset: int = 0, limit: int = 100) -> list:
     return safe_get("segments", {"offset": offset, "limit": limit})
 
 
-@mcp.tool()
+@scoped_tool()
 def list_sections(offset: int = 0, limit: int = 100) -> list:
     """
     List sections in the program with pagination.
@@ -490,7 +660,7 @@ def list_sections(offset: int = 0, limit: int = 100) -> list:
     return out
 
 
-@mcp.tool()
+@scoped_tool()
 def list_imports(offset: int = 0, limit: int = 100) -> list:
     """
     List imported symbols in the program with pagination.
@@ -498,7 +668,7 @@ def list_imports(offset: int = 0, limit: int = 100) -> list:
     return safe_get("imports", {"offset": offset, "limit": limit})
 
 
-@mcp.tool()
+@scoped_tool()
 def list_strings(offset: int = 0, count: int = 100) -> list:
     """
     List all strings in the database (paginated).
@@ -506,7 +676,7 @@ def list_strings(offset: int = 0, count: int = 100) -> list:
     return safe_get("strings", {"offset": offset, "limit": count}, timeout=None)
 
 
-@mcp.tool()
+@scoped_tool()
 def list_strings_filter(offset: int = 0, count: int = 100, filter: str = "") -> list:
     """
     List matching strings in the database (paginated, filtered).
@@ -518,7 +688,7 @@ def list_strings_filter(offset: int = 0, count: int = 100, filter: str = "") -> 
     )
 
 
-@mcp.tool()
+@scoped_tool()
 def list_local_types(offset: int = 0, count: int = 200, include_libraries: bool = False) -> list:
     """
     List all local types in the database (paginated).
@@ -534,7 +704,7 @@ def list_local_types(offset: int = 0, count: int = 200, include_libraries: bool 
     )
 
 
-@mcp.tool()
+@scoped_tool()
 def search_types(
     query: str, offset: int = 0, count: int = 200, include_libraries: bool = False
 ) -> list:
@@ -553,7 +723,7 @@ def search_types(
     )
 
 
-@mcp.tool()
+@scoped_tool()
 def list_all_strings(batch_size: int = 500) -> list:
     """
     List all strings in the database (aggregated across pages).
@@ -579,7 +749,7 @@ def list_all_strings(batch_size: int = 500) -> list:
     return results
 
 
-@mcp.tool()
+@scoped_tool()
 def list_exports(offset: int = 0, limit: int = 100) -> list:
     """
     List exported functions/symbols with pagination.
@@ -587,7 +757,7 @@ def list_exports(offset: int = 0, limit: int = 100) -> list:
     return safe_get("exports", {"offset": offset, "limit": limit})
 
 
-@mcp.tool()
+@scoped_tool()
 def list_namespaces(offset: int = 0, limit: int = 100) -> list:
     """
     List all non-global namespaces in the program with pagination.
@@ -595,7 +765,7 @@ def list_namespaces(offset: int = 0, limit: int = 100) -> list:
     return safe_get("namespaces", {"offset": offset, "limit": limit})
 
 
-@mcp.tool()
+@scoped_tool()
 def list_data_items(offset: int = 0, limit: int = 100) -> list:
     """
     List defined data labels and their values with pagination.
@@ -603,7 +773,7 @@ def list_data_items(offset: int = 0, limit: int = 100) -> list:
     return safe_get("data", {"offset": offset, "limit": limit})
 
 
-@mcp.tool()
+@scoped_tool()
 def search_functions_by_name(query: str, offset: int = 0, limit: int = 100) -> list:
     """
     Search for functions whose name contains the given substring.
@@ -613,7 +783,7 @@ def search_functions_by_name(query: str, offset: int = 0, limit: int = 100) -> l
     return safe_get("searchFunctions", {"query": query, "offset": offset, "limit": limit})
 
 
-@mcp.tool()
+@scoped_tool()
 def get_binary_status() -> str:
     """
     Get the current status of the loaded binary.
@@ -621,7 +791,7 @@ def get_binary_status() -> str:
     return safe_get("status")[0]
 
 
-@mcp.tool()
+@scoped_tool()
 def open_binary(
     filepath: str,
     analysis_mode: str = "basic",
@@ -640,17 +810,27 @@ def open_binary(
             "platform": platform,
             "image_base": image_base,
         }
-        response = requests.post(
+        response = _http.post(
             f"{binja_server_url}/load",
             json=payload,
-            timeout=30,
+            headers=_request_headers(),
         )
         try:
             data = response.json()
         except Exception:
             data = None
         if response.ok and isinstance(data, dict):
-            return data.get("message") or f"Binary loaded: {filepath}"
+            message = data.get("message") or f"Binary loaded: {filepath}"
+            selector = data.get("view_selector") or (
+                f"view:{data['view_id']}" if data.get("view_id") else None
+            )
+            filename = data.get("filename")
+            if selector or filename:
+                message += (
+                    f"\nStable selector: {selector or filename}"
+                    f"\nFull path: {filename or filepath}"
+                )
+            return message
         if isinstance(data, dict) and data.get("error"):
             return f"Error: {data['error']}"
         return f"Error {response.status_code}: {response.text.strip()}"
@@ -658,7 +838,7 @@ def open_binary(
         return f"Request failed: {exc}"
 
 
-@mcp.tool()
+@scoped_tool()
 def list_binaries() -> list:
     """
     List managed/open binaries known to the server with ids and active flag.
@@ -673,6 +853,9 @@ def list_binaries() -> list:
     for it in items:
         vid = it.get("id")
         view_id = it.get("view_id")
+        view_selector = it.get("view_selector") or (
+            f"view:{view_id}" if view_id else ""
+        )
         fn = it.get("filename")
         basename = it.get("basename") or ""
         selectors = it.get("selectors") or []
@@ -681,18 +864,19 @@ def list_binaries() -> list:
         full = fn or "(no filename)"
         selector_text = ", ".join(str(s) for s in selectors if s)
         mark = " *active*" if active else ""
-        view_part = f" view={view_id}" if view_id else ""
+        view_part = f" {view_selector}" if view_selector else ""
         out.append(
             f"{vid}. {label}{view_part}{mark}\n    path: {full}\n    selectors: {selector_text}"
         )
     return out
 
 
-@mcp.tool()
+@scoped_tool()
 def select_binary(view: str) -> str:
     """
-    Select which binary to analyze by ordinal, internal view id, full path, or basename.
-    Call this after listing binaries whenever you need to switch analysis targets.
+    Select by view:N, ordinal:N, full path, or an unambiguous basename.
+    This changes the legacy/GUI active view; still pass binary on later calls
+    whenever more than one view is open.
     """
     data = get_json("selectBinary", {"view": view})
     if not data:
@@ -710,7 +894,7 @@ def select_binary(view: str) -> str:
         selectors = sel.get("selectors") or []
         selector_text = ", ".join(str(s) for s in selectors if s)
         display_name = basename or fn or "(unknown)"
-        view_part = f" (view {view_id})" if view_id else ""
+        view_part = f" (view:{view_id})" if view_id else ""
         path_part = f"\nFull path: {fn}" if fn else ""
         return (
             f"Selected {ordinal}: {display_name}{view_part}{path_part}\nSelectors: {selector_text}"
@@ -718,7 +902,7 @@ def select_binary(view: str) -> str:
     return str(data)
 
 
-@mcp.tool()
+@scoped_tool()
 def delete_comment(address: str) -> str:
     """
     Delete the comment at a specific address.
@@ -726,7 +910,7 @@ def delete_comment(address: str) -> str:
     return safe_delete("comment", {"address": address})
 
 
-@mcp.tool()
+@scoped_tool()
 def delete_function_comment(function_name: str) -> str:
     """
     Delete the comment for a function.
@@ -734,7 +918,7 @@ def delete_function_comment(function_name: str) -> str:
     return safe_delete("comment/function", {"name": function_name})
 
 
-@mcp.tool()
+@scoped_tool()
 def function_at(address: str) -> str:
     """
     Retrive the name of the function the address belongs to. Address must be in hexadecimal format 0x00001
@@ -742,7 +926,7 @@ def function_at(address: str) -> str:
     return "\n".join(safe_get("functionAt", {"address": address}))
 
 
-@mcp.tool()
+@scoped_tool()
 def get_user_defined_type(type_name: str) -> str:
     """
     Retrive definition of a user defined type (struct, enumeration, typedef, union)
@@ -750,7 +934,7 @@ def get_user_defined_type(type_name: str) -> str:
     return "\n".join(safe_get("getUserDefinedType", {"name": type_name}))
 
 
-@mcp.tool()
+@scoped_tool()
 def get_xrefs_to(address: str) -> list:
     """
     Get all cross references (code and data) to the given address.
@@ -759,7 +943,7 @@ def get_xrefs_to(address: str) -> list:
     return safe_get("getXrefsTo", {"address": address})
 
 
-@mcp.tool()
+@scoped_tool()
 def get_xrefs_to_field(struct_name: str, field_name: str) -> list:
     """
     Get all cross references to a named struct field (member).
@@ -767,7 +951,7 @@ def get_xrefs_to_field(struct_name: str, field_name: str) -> list:
     return safe_get("getXrefsToField", {"struct": struct_name, "field": field_name})
 
 
-@mcp.tool()
+@scoped_tool()
 def get_xrefs_to_struct(struct_name: str) -> list:
     """
     Get cross references/usages related to a struct name.
@@ -775,7 +959,7 @@ def get_xrefs_to_struct(struct_name: str) -> list:
     return safe_get("getXrefsToStruct", {"name": struct_name})
 
 
-@mcp.tool()
+@scoped_tool()
 def get_xrefs_to_type(type_name: str) -> list:
     """
     Get xrefs/usages related to a struct or type name.
@@ -784,7 +968,7 @@ def get_xrefs_to_type(type_name: str) -> list:
     return safe_get("getXrefsToType", {"name": type_name})
 
 
-@mcp.tool()
+@scoped_tool()
 def get_xrefs_to_enum(enum_name: str) -> list:
     """
     Get usages/xrefs of an enum by scanning for member values and matches.
@@ -792,7 +976,7 @@ def get_xrefs_to_enum(enum_name: str) -> list:
     return safe_get("getXrefsToEnum", {"name": enum_name})
 
 
-@mcp.tool()
+@scoped_tool()
 def get_xrefs_to_union(union_name: str) -> list:
     """
     Get cross references/usages related to a union type by name.
@@ -800,7 +984,7 @@ def get_xrefs_to_union(union_name: str) -> list:
     return safe_get("getXrefsToUnion", {"name": union_name})
 
 
-@mcp.tool()
+@scoped_tool()
 def get_stack_frame_vars(function_identifier: str) -> list:
     """
     Get stack frame variable information for a function by name or address.
@@ -823,7 +1007,7 @@ def get_stack_frame_vars(function_identifier: str) -> list:
     return []
 
 
-@mcp.tool()
+@scoped_tool()
 def format_value(address: str, text: str, size: int = 0) -> list:
     """
     Convert and annotate a value at an address in Binary Ninja.
@@ -832,7 +1016,7 @@ def format_value(address: str, text: str, size: int = 0) -> list:
     return safe_get("formatValue", {"address": address, "text": text, "size": size}, timeout=None)
 
 
-@mcp.tool()
+@scoped_tool()
 def convert_number(text: str, size: int = 0) -> str:
     """
     Convert a number or string to multiple representations (hex/dec/bin, LE/BE, C char/string literals).
@@ -849,7 +1033,7 @@ def convert_number(text: str, size: int = 0) -> str:
     return _json.dumps(data, indent=2, ensure_ascii=False)
 
 
-@mcp.tool()
+@scoped_tool()
 def get_type_info(type_name: str) -> str:
     """
     Resolve a type name and return its declaration and details (kind, members, enum values).
@@ -877,7 +1061,7 @@ def _normalize_identifier_input(value: str | list[str]) -> list[str]:
     return tokens
 
 
-@mcp.tool()
+@scoped_tool()
 def get_callers(identifiers: str) -> str:
     """
     List callers and caller sites for one or more function identifiers (name or address).
@@ -894,7 +1078,7 @@ def get_callers(identifiers: str) -> str:
     return _json.dumps(data, indent=2, ensure_ascii=False)
 
 
-@mcp.tool()
+@scoped_tool()
 def get_callees(identifiers: str) -> str:
     """
     List callees and call sites for one or more function identifiers (name or address).
@@ -911,7 +1095,7 @@ def get_callees(identifiers: str) -> str:
     return _json.dumps(data, indent=2, ensure_ascii=False)
 
 
-@mcp.tool()
+@scoped_tool()
 def set_function_prototype(name_or_address: str, prototype: str) -> str:
     """
     Set a function's prototype by name or address.
@@ -924,7 +1108,7 @@ def set_function_prototype(name_or_address: str, prototype: str) -> str:
         params["address"] = ident
     else:
         params["name"] = ident
-    data = get_json("setFunctionPrototype", params)
+    data = get_json("setFunctionPrototype", params, timeout=None)
     if not data:
         return "Error: no response"
     if isinstance(data, dict) and "status" in data:
@@ -934,7 +1118,7 @@ def set_function_prototype(name_or_address: str, prototype: str) -> str:
     return str(data)
 
 
-@mcp.tool()
+@scoped_tool()
 def make_function_at(address: str, platform: str = "") -> str:
     """
     Create a function at the given address. Platform is optional (e.g., "linux-x86_64").
@@ -944,7 +1128,7 @@ def make_function_at(address: str, platform: str = "") -> str:
     params = {"address": address}
     if platform:
         params["platform"] = platform
-    data = get_json("makeFunctionAt", params)
+    data = get_json("makeFunctionAt", params, timeout=None)
     if not data:
         return "Error: no response"
     if isinstance(data, dict) and data.get("error"):
@@ -958,7 +1142,7 @@ def make_function_at(address: str, platform: str = "") -> str:
     return str(data)
 
 
-@mcp.tool()
+@scoped_tool()
 def list_platforms() -> str:
     """
     List all available platform names from Binary Ninja.
@@ -976,12 +1160,12 @@ def list_platforms() -> str:
     return "\n".join(plats)
 
 
-@mcp.tool()
+@scoped_tool()
 def declare_c_type(c_declaration: str) -> str:
     """
     Create or update a local type from a C declaration.
     """
-    data = get_json("declareCType", {"declaration": c_declaration})
+    data = get_json("declareCType", {"declaration": c_declaration}, timeout=None)
     if not data:
         return "Error: no response"
     if isinstance(data, dict) and data.get("defined_types"):
@@ -992,7 +1176,7 @@ def declare_c_type(c_declaration: str) -> str:
     return str(data)
 
 
-@mcp.tool()
+@scoped_tool()
 def set_local_variable_type(function_address: str, variable_name: str, new_type: str) -> str:
     """
     Set a local variable's type.
@@ -1004,6 +1188,7 @@ def set_local_variable_type(function_address: str, variable_name: str, new_type:
             "variableName": variable_name,
             "newType": new_type,
         },
+        timeout=None,
     )
     if not data:
         return "Error: no response"
@@ -1014,7 +1199,7 @@ def set_local_variable_type(function_address: str, variable_name: str, new_type:
     return str(data)
 
 
-@mcp.tool()
+@scoped_tool()
 def patch_bytes(address: str, data: str, save_to_file: bool = True) -> str:
     """
     Patch bytes at a given address in the binary.
@@ -1031,7 +1216,7 @@ def patch_bytes(address: str, data: str, save_to_file: bool = True) -> str:
         save_to_file = save_to_file.lower() not in ("false", "0", "no")
 
     params = {"address": address, "data": data, "save_to_file": save_to_file}
-    result = get_json("patch", params)
+    result = get_json("patch", params, timeout=None)
     if not result:
         return "Error: no response"
 
@@ -1079,6 +1264,7 @@ if __name__ == "__main__":
     # Important: write any logs to stderr to avoid corrupting MCP stdio JSON-RPC
     print("Starting MCP bridge service...", file=_sys.stderr)
     try:
+        _start_parent_watchdog()
         mcp.run()
     except Exception as _e:
         # Ensure any runtime exception is captured in the log file

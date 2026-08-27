@@ -13,11 +13,22 @@ server as the capability and this skill as its operating workflow.
 1. Work only on binaries the user placed in scope. Use an absolute path.
 2. Call `get_binary_status` or `list_binaries` before opening a new target.
 3. Call `open_binary` when the requested target is not already active, then
-   confirm the filename and loaded state with `get_binary_status`.
-4. If multiple binaries are open, call `select_binary` before every analysis
-   sequence where target ambiguity would matter.
+   retain the stable selector it returns and confirm the filename and loaded
+   state with `get_binary_status(binary=<selector>)`.
+4. Pass `binary=<view:N selector or absolute filename>` on every subsequent
+   target-dependent tool call. This is mandatory when subagents or concurrent
+   calls may share the MCP server: `select_binary` is legacy mutable state and
+   is not a concurrency boundary.
 5. Use `convert_number` for base, endian, character, or byte conversions; do
    not perform address-base conversions manually.
+
+Use `list_binaries` to recover a selector for an already-open view. Prefer its
+namespaced `view:N` selector or full absolute filename. Bare numeric ids are
+intentionally rejected because an internal id can collide with a sorted
+ordinal; `ordinal:N` is available for short-lived interactive selection only.
+`select_binary` remains available for inspecting/changing the GUI's active
+selection, but it does not scope later requests when multiple views are open.
+Explicit `binary` arguments are the authoritative targeting mechanism.
 
 ## Analyze progressively
 
