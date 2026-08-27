@@ -74,12 +74,13 @@ python scripts/mcp_client_installer.py --config     # print a generic JSON confi
 
 For Codex, `--install` installs both the bundled Binary Ninja analysis skill at
 `${CODEX_HOME:-~/.codex}/skills/binary-ninja` and a persistent headless
-`binary_ninja` MCP server entry through `codex mcp add`. Absolute paths are
-recorded for the Python interpreter, launcher, and bridge environment, so the
-server does not depend on Binary Ninja's GUI or the launching application's
-working directory. `--uninstall` removes only the files and server entry
-managed by this repository. Start a new Codex task after installation so the
-MCP tool catalog and skill catalog are refreshed.
+`binary_ninja` MCP server entry. The installer losslessly merges the entry so
+existing environment, enablement, tool-filter, and approval settings survive a
+reinstall. Absolute paths are recorded for the Python interpreter, launcher,
+and bridge environment, so the server does not depend on Binary Ninja's GUI or
+the launching application's working directory. `--uninstall` removes only the
+files and server entry managed by this repository. Start a new Codex task after
+installation so the MCP tool catalog and skill catalog are refreshed.
 
 The Codex headless launcher uses an authenticated, OS-assigned loopback port
 for each process, so concurrent Codex tasks cannot attach to one another's
@@ -183,9 +184,18 @@ manual installation, add the launcher to Codex's MCP configuration:
 command = "python3.13"
 args = ["/ABSOLUTE/PATH/TO/binary_ninja_mcp/scripts/run_headless_mcp.py"]
 startup_timeout_sec = 45
-tool_timeout_sec = 120
-default_tools_approval_mode = "approve"
+tool_timeout_sec = 1800
 ```
+
+The bridge uses a five-second loopback connection timeout and a finite
+29-minute response-read timeout. Binary Ninja analysis requests are serialized
+for database safety and can legitimately queue behind decompilation on a large
+target; the longer read budget prevents the former five-second queue failure
+while still bounding a wedged worker. Override these independently with
+`BINJA_MCP_HTTP_CONNECT_TIMEOUT_SEC` and `BINJA_MCP_HTTP_READ_TIMEOUT_SEC`.
+Codex is configured with a minimum 30-minute tool-response budget. Reinstalling
+raises shorter startup/tool budgets to these minimums, preserves larger
+user-defined budgets, and does not change the user's tool approval policy.
 
 After Codex restarts, use the `open_binary` MCP tool with an absolute path.
 Opening creates and selects the view promptly, then runs conservative `basic`
@@ -199,9 +209,8 @@ when the additional analysis cost is intentional.
 A startup target can instead be supplied by appending `--binary`, followed by
 its path, to `args`. The launcher supervises both children and tears down the
 bridge if the Binary Ninja HTTP host exits, preventing a stale MCP process that
-accepts calls while no analysis service is listening. The `approve` mode trusts
-every tool exposed by this MCP server without per-call prompts; leave
-`enabled_tools` unset to expose the complete tool set.
+accepts calls while no analysis service is listening. Leave `enabled_tools`
+unset to expose the complete tool set, or retain a narrower user-defined list.
 
 ## Usage
 

@@ -31,9 +31,7 @@ class Named:
 
 
 class FakeBinaryNinja:
-    def __init__(
-        self, architectures: list[str], platforms: list[str], view_types: list[str]
-    ):
+    def __init__(self, architectures: list[str], platforms: list[str], view_types: list[str]):
         self.Architecture = [Named(name) for name in architectures]
         self.Platform = [Named(name) for name in platforms]
         self.BinaryViewType = [Named(name) for name in view_types]
@@ -51,9 +49,7 @@ class HeadlessHostTests(unittest.TestCase):
         self.assertTrue(bn.initialized)
 
     def test_runtime_accepts_architecture_and_format_view(self):
-        bn = FakeBinaryNinja(
-            ["aarch64"], ["mac-aarch64"], ["Raw", "Mapped", "Mach-O"]
-        )
+        bn = FakeBinaryNinja(["aarch64"], ["mac-aarch64"], ["Raw", "Mapped", "Mach-O"])
         architectures, platforms, views = headless_host.validate_runtime(bn)
         self.assertEqual(architectures, ["aarch64"])
         self.assertEqual(platforms, ["mac-aarch64"])
@@ -98,9 +94,7 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(env["BN_MCP_HEADLESS"], "1")
 
     def test_parser_accepts_multiple_startup_binaries(self):
-        args = launcher.build_parser().parse_args(
-            ["--binary", "/tmp/one", "--binary", "/tmp/two"]
-        )
+        args = launcher.build_parser().parse_args(["--binary", "/tmp/one", "--binary", "/tmp/two"])
         self.assertEqual(args.binary, ["/tmp/one", "/tmp/two"])
 
     def test_parser_defaults_to_os_assigned_port(self):
@@ -298,13 +292,9 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("--ready-file", host_call.args[0])
         self.assertEqual(host_call.kwargs["stdin"], launcher.subprocess.PIPE)
         self.assertEqual(bridge_call.kwargs["env"]["BINJA_MCP_PORT"], "45678")
-        self.assertEqual(
-            bridge_call.kwargs["env"]["BINJA_MCP_INSTANCE_ID"], "instance-a"
-        )
+        self.assertEqual(bridge_call.kwargs["env"]["BINJA_MCP_INSTANCE_ID"], "instance-a")
         self.assertTrue(bridge_call.kwargs["env"]["BINJA_MCP_AUTH_TOKEN"])
-        self.assertEqual(
-            bridge_call.kwargs["env"]["BINJA_MCP_PARENT_PID"], str(os.getpid())
-        )
+        self.assertEqual(bridge_call.kwargs["env"]["BINJA_MCP_PARENT_PID"], str(os.getpid()))
 
     def test_supervisor_stops_bridge_when_host_exits(self):
         host = mock.Mock()

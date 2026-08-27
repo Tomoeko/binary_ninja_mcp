@@ -5,8 +5,11 @@ import json
 import os
 import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
+
+import requests
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -182,7 +185,140 @@ class BridgeTargetingTests(unittest.TestCase):
 
         self.assertIn("Applied prototype", result)
         self.assertEqual(len(calls), 1)
-        self.assertNotIn("timeout", calls[0])
+        self.assertEqual(calls[0]["timeout"], self.bridge._DEFAULT_HTTP_TIMEOUT)
+
+    def test_default_transport_has_short_connect_and_long_finite_read_budget(self):
+        response = FakeResponse({"filename": "/tmp/a.bin", "loaded": True})
+        with (
+            mock.patch.object(self.bridge._http, "get", return_value=response) as get,
+            mock.patch.object(self.bridge._http, "post", return_value=response) as post,
+            mock.patch.object(self.bridge._http, "delete", return_value=response) as delete,
+        ):
+            self.bridge.safe_get("status")
+            self.bridge.get_json("status")
+            self.bridge.get_text("status")
+            self.bridge.safe_post("comment", {"address": "0x1000", "comment": "ok"})
+            self.bridge.safe_delete("comment", {"address": "0x1000"})
+
+        calls = [*get.call_args_list, *post.call_args_list, *delete.call_args_list]
+        self.assertEqual(len(calls), 5)
+        for call in calls:
+            self.assertEqual(call.kwargs["timeout"], self.bridge._DEFAULT_HTTP_TIMEOUT)
+        self.assertEqual(self.bridge._HTTP_CONNECT_TIMEOUT_SEC, 5.0)
+        self.assertEqual(self.bridge._HTTP_READ_TIMEOUT_SEC, 1740.0)
+
+    def test_default_request_survives_a_serialized_host_queue(self):
+        operation_lock = threading.Lock()
+        slow_entered = threading.Event()
+        release_slow = threading.Event()
+        abandoned_entered = threading.Event()
+        queued_entered = threading.Event()
+
+        class QueueingHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                if self.path.startswith("/abandoned"):
+                    abandoned_entered.set()
+                if self.path.startswith("/queued"):
+                    queued_entered.set()
+                with operation_lock:
+                    if self.path.startswith("/slow"):
+                        slow_entered.set()
+                        release_slow.wait(timeout=10)
+                    payload = json.dumps({"path": self.path}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(payload)
+                    except OSError:
+                        pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), QueueingHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        previous_url = self.bridge.binja_server_url
+        self.bridge.binja_server_url = f"http://127.0.0.1:{server.server_address[1]}"
+        slow_result: list[object] = []
+        slow_thread = threading.Thread(
+            target=lambda: slow_result.append(self.bridge.get_json("slow"))
+        )
+        queued_result: list[object] = []
+        queued_thread = threading.Thread(
+            target=lambda: queued_result.append(self.bridge.get_json("queued"))
+        )
+        try:
+            slow_thread.start()
+            self.assertTrue(slow_entered.wait(timeout=2))
+
+            # Reproduce the old failure with a compressed timeout: a scalar
+            # request abandons a healthy operation solely because it is queued
+            # behind the host lock.
+            control = requests.Session()
+            control.trust_env = False
+            with self.assertRaises(requests.exceptions.ReadTimeout):
+                control.get(
+                    f"{self.bridge.binja_server_url}/abandoned",
+                    timeout=(0.05, 0.05),
+                )
+            control.close()
+            self.assertTrue(abandoned_entered.wait(timeout=2))
+
+            queued_thread.start()
+            self.assertTrue(queued_entered.wait(timeout=2))
+            self.assertTrue(slow_thread.is_alive())
+            release_slow.set()
+
+            slow_thread.join(timeout=2)
+            queued_thread.join(timeout=2)
+            self.assertFalse(slow_thread.is_alive())
+            self.assertFalse(queued_thread.is_alive())
+            self.assertEqual(slow_result, [{"path": "/slow"}])
+            self.assertEqual(queued_result, [{"path": "/queued"}])
+        finally:
+            release_slow.set()
+            slow_thread.join(timeout=2)
+            queued_thread.join(timeout=2)
+            self.bridge.binja_server_url = previous_url
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+    def test_http_sessions_are_isolated_per_worker_thread(self):
+        created: list[object] = []
+        create_lock = threading.Lock()
+
+        class Session:
+            def __init__(self):
+                self.trust_env = True
+
+        def factory():
+            session = Session()
+            with create_lock:
+                created.append(session)
+            return session
+
+        client = self.bridge._ThreadLocalHttpClient(factory)
+        barrier = threading.Barrier(2)
+        observed: list[object] = []
+
+        def worker():
+            session = client._session()
+            barrier.wait(timeout=2)
+            observed.append(session)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+
+        self.assertEqual(len(created), 2)
+        self.assertEqual(len({id(session) for session in observed}), 2)
+        self.assertTrue(all(session.trust_env is False for session in created))
 
 
 if __name__ == "__main__":

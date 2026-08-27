@@ -19,9 +19,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_BN_PYTHON = Path(
-    "/Applications/Binary Ninja.app/Contents/Resources/python"
-)
+DEFAULT_BN_PYTHON = Path("/Applications/Binary Ninja.app/Contents/Resources/python")
 # Local authenticated control traffic must never inherit HTTP_PROXY/ALL_PROXY.
 # Besides breaking loopback startup, doing so could disclose the per-launch
 # bearer token to an ambient proxy.
@@ -112,9 +110,7 @@ def find_bridge_python(override: str | None) -> str:
             # Do not resolve a virtualenv's python symlink: executing the target
             # directly drops the virtualenv's site-packages.
             return str(candidate.absolute())
-        raise RuntimeError(
-            f"Bridge Python cannot import mcp and requests: {candidate}"
-        )
+        raise RuntimeError(f"Bridge Python cannot import mcp and requests: {candidate}")
 
     candidates = [
         REPO_ROOT / ".venv" / "bin" / "python",
@@ -133,9 +129,7 @@ def find_bridge_python(override: str | None) -> str:
 
 def host_environment(bn_python_path: Path) -> dict[str, str]:
     if not (bn_python_path / "binaryninja").is_dir():
-        raise FileNotFoundError(
-            f"binaryninja package not found below: {bn_python_path}"
-        )
+        raise FileNotFoundError(f"binaryninja package not found below: {bn_python_path}")
     env = os.environ.copy()
     current_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = str(bn_python_path) + (
@@ -256,9 +250,7 @@ def wait_for_host(
     while time.monotonic() < deadline:
         return_code = process.poll()
         if return_code is not None:
-            raise RuntimeError(
-                f"Binary Ninja headless host exited during startup ({return_code})"
-            )
+            raise RuntimeError(f"Binary Ninja headless host exited during startup ({return_code})")
         if endpoint is None:
             endpoint = read_ready_file(
                 ready_file,
@@ -280,12 +272,8 @@ def wait_for_host(
             with DIRECT_HTTP_OPENER.open(request, timeout=0.5) as response:
                 status = json.load(response)
                 if status.get("instance_id") != expected_instance_id:
-                    raise RuntimeError(
-                        "Binary Ninja HTTP host instance identity mismatch"
-                    )
-                if response.status == 200 and (
-                    not require_loaded or bool(status.get("loaded"))
-                ):
+                    raise RuntimeError("Binary Ninja HTTP host instance identity mismatch")
+                if response.status == 200 and (not require_loaded or bool(status.get("loaded"))):
                     return endpoint
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
@@ -362,9 +350,7 @@ def main(argv: list[str] | None = None) -> int:
             str(args.port),
         ]
         for binary in args.binary:
-            host_command.extend(
-                ["--binary", str(Path(binary).expanduser().resolve())]
-            )
+            host_command.extend(["--binary", str(Path(binary).expanduser().resolve())])
         if args.check:
             host_command.append("--check")
             return subprocess.run(host_command, env=env, check=False).returncode
@@ -403,9 +389,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.startup_timeout,
                 require_loaded=bool(args.binary),
                 target_binary=(
-                    str(Path(args.binary[0]).expanduser().resolve())
-                    if args.binary
-                    else None
+                    str(Path(args.binary[0]).expanduser().resolve()) if args.binary else None
                 ),
             )
 

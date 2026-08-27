@@ -72,8 +72,8 @@ def _load_selector_modules():
     config.Config = _BinaryNinjaConfig
     string_utils = types.ModuleType(f"{FIXTURE_PACKAGE}.utils.string_utils")
     string_utils.escape_non_ascii = lambda value: value
-    string_utils.parse_int_or_default = (
-        lambda value, default: default if value is None else int(value)
+    string_utils.parse_int_or_default = lambda value, default: (
+        default if value is None else int(value)
     )
     number_utils = types.ModuleType(f"{FIXTURE_PACKAGE}.utils.number_utils")
     number_utils.convert_number = lambda value, _size=0: value
@@ -125,6 +125,49 @@ class _FakeFile:
 class _FakeView:
     def __init__(self, filename: str):
         self.file = _FakeFile(filename)
+
+
+class _FakeInstruction:
+    def __init__(self, address: int, text: str):
+        self.address = address
+        self.text = text
+
+    def __str__(self):
+        return self.text
+
+
+class _FakeIl:
+    def __init__(self, *instructions: _FakeInstruction):
+        self.instructions = list(instructions)
+
+
+class _FakeFunction:
+    def __init__(self):
+        self.name = "target"
+        self.start = 0x1000
+        self.analysis_skipped = True
+        self.hlil = _FakeIl(_FakeInstruction(0x1000, "return 1"))
+        self.mlil = _FakeIl(_FakeInstruction(0x1004, "var_0 = 1"))
+        self.llil = _FakeIl(_FakeInstruction(0x1008, "LLIL_RET(1)"))
+
+
+class _FunctionView(_FakeView):
+    def __init__(self, function: _FakeFunction):
+        super().__init__("/fixtures/function.bin")
+        self.functions = [function]
+        self.whole_view_waits = 0
+
+    def get_function_at(self, address: int):
+        if address == self.functions[0].start:
+            return self.functions[0]
+        return None
+
+    def get_symbol_by_raw_name(self, _name: str):
+        return None
+
+    def update_analysis_and_wait(self):
+        self.whole_view_waits += 1
+        raise AssertionError("function-local IL must not wait for the whole BinaryView")
 
 
 class MultiBinarySelectorTests(unittest.TestCase):
@@ -185,9 +228,7 @@ class MultiBinarySelectorTests(unittest.TestCase):
             "/fixtures/one/shared.bin",
             "/fixtures/two/shared.bin",
         )
-        listing = endpoint_module.BinaryNinjaEndpoints(operations).list_binaries()[
-            "binaries"
-        ]
+        listing = endpoint_module.BinaryNinjaEndpoints(operations).list_binaries()["binaries"]
 
         self.assertEqual(len(listing), 2)
         for entry in listing:
@@ -200,6 +241,28 @@ class MultiBinarySelectorTests(unittest.TestCase):
         self.assertIn(current_before, views)
 
 
+class FunctionIlSchedulingTests(unittest.TestCase):
+    def setUp(self):
+        self.function = _FakeFunction()
+        self.view = _FunctionView(self.function)
+        self.operations = binary_operations.BinaryOperations(_BinaryNinjaConfig())
+        self.operations.current_view = self.view
+
+    def test_decompile_uses_on_demand_function_il_without_a_whole_view_wait(self):
+        result = self.operations.decompile_function("target")
+
+        self.assertEqual(result, "00001000        return 1")
+        self.assertFalse(self.function.analysis_skipped)
+        self.assertEqual(self.view.whole_view_waits, 0)
+
+    def test_il_uses_on_demand_function_il_without_a_whole_view_wait(self):
+        result = self.operations.get_function_il("target", view="mlil")
+
+        self.assertEqual(result, "00001004        var_0 = 1")
+        self.assertFalse(self.function.analysis_skipped)
+        self.assertEqual(self.view.whole_view_waits, 0)
+
+
 class ExplicitTargetGuardTests(unittest.TestCase):
     def _handler(
         self,
@@ -208,9 +271,7 @@ class ExplicitTargetGuardTests(unittest.TestCase):
         target: str = "",
         encoded_target: str = "",
     ):
-        handler = server_module.MCPRequestHandler.__new__(
-            server_module.MCPRequestHandler
-        )
+        handler = server_module.MCPRequestHandler.__new__(server_module.MCPRequestHandler)
         handler.binary_ops = operations
         handler.auth_token = None
         handler.path = path
@@ -220,10 +281,8 @@ class ExplicitTargetGuardTests(unittest.TestCase):
         if encoded_target:
             handler.headers["X-Binary-Ninja-View-B64"] = encoded_target
         handler.responses = []
-        handler._send_json_response = (
-            lambda payload, status_code=200: handler.responses.append(
-                (status_code, payload)
-            )
+        handler._send_json_response = lambda payload, status_code=200: handler.responses.append(
+            (status_code, payload)
         )
         return handler
 
@@ -268,9 +327,7 @@ class ExplicitTargetGuardTests(unittest.TestCase):
         self.assertIs(operations.current_view, views[0])
 
     def test_single_view_request_remains_backward_compatible_without_target(self):
-        operations, _views = MultiBinarySelectorTests()._operations(
-            "/fixtures/only.bin"
-        )
+        operations, _views = MultiBinarySelectorTests()._operations("/fixtures/only.bin")
         handler = self._handler(operations, "/status")
 
         self.assertTrue(handler._prepare_request())
@@ -282,9 +339,7 @@ class ExplicitTargetGuardTests(unittest.TestCase):
             "/fixtures/other.bin",
             unicode_path,
         )
-        encoded = base64.urlsafe_b64encode(unicode_path.encode("utf-8")).decode(
-            "ascii"
-        )
+        encoded = base64.urlsafe_b64encode(unicode_path.encode("utf-8")).decode("ascii")
         handler = self._handler(
             operations,
             "/status",

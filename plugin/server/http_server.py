@@ -284,8 +284,8 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         if target and (not self.binary_ops or not self.binary_ops.select_view(target)):
             available = []
             if self.binary_ops:
-                available = BinaryNinjaEndpoints(self.binary_ops).list_binaries().get(
-                    "binaries", []
+                available = (
+                    BinaryNinjaEndpoints(self.binary_ops).list_binaries().get("binaries", [])
                 )
             self._send_json_response(
                 {
@@ -305,12 +305,10 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             self._send_json_response(
                 {
                     "error": (
-                        "Explicit binary selector required because more than one "
-                        "binary is open"
+                        "Explicit binary selector required because more than one binary is open"
                     ),
                     "help": (
-                        "Send X-Binary-Ninja-View with a view:N selector or an "
-                        "absolute filename"
+                        "Send X-Binary-Ninja-View with a view:N selector or an absolute filename"
                     ),
                 },
                 409,
@@ -2068,8 +2066,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                         {
                             "success": True,
                             "message": (
-                                f"Binary opened: {view.file.filename}; "
-                                "background analysis started"
+                                f"Binary opened: {view.file.filename}; background analysis started"
                             ),
                             "filename": view.file.filename,
                             "view_id": view_id,

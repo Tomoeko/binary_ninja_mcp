@@ -12,6 +12,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--python", default="python3.13")
@@ -91,9 +92,7 @@ def main() -> int:
         return response
 
     def call_tool(name: str, arguments: dict | None = None, timeout: int = 45) -> str:
-        response = request(
-            "tools/call", {"name": name, "arguments": arguments or {}}, timeout
-        )
+        response = request("tools/call", {"name": name, "arguments": arguments or {}}, timeout)
         result = response.get("result") or {}
         if result.get("isError"):
             raise RuntimeError(f"Tool {name} failed: {result}")
@@ -124,9 +123,7 @@ def main() -> int:
         open_elapsed = time.monotonic() - started
         if "background analysis started" not in opened:
             raise RuntimeError(f"open_binary returned an unexpected result: {opened}")
-        opened_status = call_tool(
-            "get_binary_status", {"binary": str(open_path)}
-        )
+        opened_status = call_tool("get_binary_status", {"binary": str(open_path)})
         parsed_status = json.loads(opened_status)
         if parsed_status.get("filename") != str(open_path):
             raise RuntimeError(f"open_binary selected the wrong view: {opened_status}")
@@ -136,9 +133,7 @@ def main() -> int:
             scoped_statuses[str(target)] = scoped
             parsed_scoped = json.loads(scoped)
             if parsed_scoped.get("filename") != str(target):
-                raise RuntimeError(
-                    f"explicit binary selector targeted the wrong view: {scoped}"
-                )
+                raise RuntimeError(f"explicit binary selector targeted the wrong view: {scoped}")
 
         sidecar = open_path.with_suffix(".json")
         if sidecar.is_file():
@@ -157,9 +152,7 @@ def main() -> int:
     regression_results: dict[str, str] = {}
     if args.regressions:
         regression_results["list_platforms"] = call_tool("list_platforms")
-        regression_results["function_at"] = call_tool(
-            "function_at", {"address": "0x40035c"}
-        )
+        regression_results["function_at"] = call_tool("function_at", {"address": "0x40035c"})
         regression_results["get_user_defined_type"] = call_tool(
             "get_user_defined_type", {"type_name": "__mcp_missing_type__"}
         )
@@ -168,9 +161,7 @@ def main() -> int:
             "set_comment",
             {"address": "0x40035c", "comment": "headless MCP regression"},
         )
-        regression_results["delete_comment"] = call_tool(
-            "delete_comment", {"address": "0x40035c"}
-        )
+        regression_results["delete_comment"] = call_tool("delete_comment", {"address": "0x40035c"})
         call_tool(
             "set_function_comment",
             {"function_name": "alloc_ep_req", "comment": "headless MCP regression"},

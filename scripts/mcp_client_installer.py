@@ -28,6 +28,11 @@ MCP_SERVER_KEY = "binary_ninja_mcp"
 CODEX_MCP_SERVER_KEY = "binary_ninja"
 CODEX_SKILL_NAME = "binary-ninja"
 CODEX_SKILL_FILES = ("SKILL.md", os.path.join("agents", "openai.yaml"))
+CODEX_CONFIG_EDITOR_REQUIREMENT = "tomlkit>=0.13.2,<1"
+MACOS_CODEX_APP_EXECUTABLES = (
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    "/Applications/Codex.app/Contents/Resources/codex",
+)
 
 
 def _repo_root() -> str:
@@ -62,13 +67,117 @@ def _codex_skill_source() -> str:
     return os.path.join(_repo_root(), "skills", CODEX_SKILL_NAME)
 
 
-def _codex_skill_target(codex_home: str | None = None) -> str:
+def _codex_home(codex_home: str | None = None) -> str:
     if codex_home is None:
         codex_home = os.environ.get("CODEX_HOME")
     if not codex_home:
         codex_home = os.path.join(os.path.expanduser("~"), ".codex")
-    root = os.path.abspath(os.path.expanduser(codex_home))
-    return os.path.join(root, "skills", CODEX_SKILL_NAME)
+    return os.path.abspath(os.path.expanduser(codex_home))
+
+
+def _codex_skill_target(codex_home: str | None = None) -> str:
+    return os.path.join(_codex_home(codex_home), "skills", CODEX_SKILL_NAME)
+
+
+def _codex_config_editor() -> str:
+    return os.path.join(_repo_root(), "scripts", "codex_config_editor.py")
+
+
+def _ensure_codex_config_editor_runtime(bridge_python: str) -> None:
+    """Make the lossless TOML editor available in an existing managed venv."""
+    probe = subprocess.run(
+        [
+            bridge_python,
+            "-c",
+            "import tomlkit; "
+            "parts = [int(value) for value in tomlkit.__version__.split('.')[:3]]; "
+            "parts += [0] * (3 - len(parts)); "
+            "assert (0, 13, 2) <= tuple(parts) < (1, 0, 0)",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if probe.returncode == 0:
+        return
+
+    install = subprocess.run(
+        [
+            bridge_python,
+            "-m",
+            "pip",
+            "install",
+            CODEX_CONFIG_EDITOR_REQUIREMENT,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    if install.returncode != 0:
+        output = "\n".join(
+            value.strip() for value in (install.stdout, install.stderr) if value.strip()
+        )
+        raise RuntimeError(f"Codex config editor dependency installation failed: {output}")
+
+
+def _configure_codex_mcp_entry(
+    config_python: str,
+    command: str,
+    args: list[str],
+    codex_home: str | None = None,
+    codex_cli: str | None = None,
+) -> bool:
+    """Losslessly merge this server into Codex's configuration."""
+    config_path = os.path.join(_codex_home(codex_home), "config.toml")
+    editor_command = [
+        config_python,
+        _codex_config_editor(),
+        "--config",
+        config_path,
+        "--command",
+        command,
+        "--args-json",
+        json.dumps(args),
+    ]
+    if codex_cli:
+        editor_command.extend(["--codex-cli", codex_cli])
+    result = subprocess.run(
+        editor_command,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    if result.returncode != 0:
+        output = "\n".join(
+            value.strip() for value in (result.stdout, result.stderr) if value.strip()
+        )
+        raise RuntimeError(f"Codex MCP configuration failed: {output}")
+    return result.stdout.strip() == "updated"
+
+
+def _validate_codex_registration(codex_home: str | None = None) -> None:
+    """Ask the installed Codex CLI to validate the resulting server entry."""
+    codex = _codex_executable()
+    if not codex:
+        return
+    environment = os.environ.copy()
+    environment["CODEX_HOME"] = _codex_home(codex_home)
+    result = subprocess.run(
+        [codex, "mcp", "get", CODEX_MCP_SERVER_KEY],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        output = "\n".join(
+            value.strip() for value in (result.stdout, result.stderr) if value.strip()
+        )
+        raise RuntimeError(f"Codex rejected the Binary Ninja MCP entry: {output}")
 
 
 def _same_file(left: str, right: str) -> bool:
@@ -144,6 +253,10 @@ def _codex_executable() -> str | None:
         candidate = os.path.abspath(os.path.expanduser(override))
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
+    if sys.platform == "darwin":
+        for candidate in MACOS_CODEX_APP_EXECUTABLES:
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
     return shutil.which("codex")
 
 
@@ -153,9 +266,7 @@ def _binary_ninja_python() -> str:
         candidate = os.path.abspath(os.path.expanduser(override))
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
-        raise RuntimeError(
-            f"BINJA_MCP_PYTHON is not an executable file: {candidate}"
-        )
+        raise RuntimeError(f"BINJA_MCP_PYTHON is not an executable file: {candidate}")
 
     candidate = shutil.which("python3.13")
     if candidate:
@@ -200,13 +311,9 @@ def _validate_codex_runtime(host_python: str, bridge_python: str) -> None:
         if result.returncode == 0:
             continue
         output = "\n".join(
-            value.strip()
-            for value in (result.stdout, result.stderr)
-            if value.strip()
+            value.strip() for value in (result.stdout, result.stderr) if value.strip()
         )
-        raise RuntimeError(
-            f"{description} validation failed (exit {result.returncode}): {output}"
-        )
+        raise RuntimeError(f"{description} validation failed (exit {result.returncode}): {output}")
 
 
 def install_codex_mcp_server(
@@ -217,50 +324,51 @@ def install_codex_mcp_server(
 ) -> bool:
     """Install the restart-safe headless server in Codex's TOML configuration.
 
-    Use ``codex mcp`` instead of editing TOML directly. This keeps installation
-    compatible with Codex configuration schema changes and makes repeated
-    installs idempotently replace stale paths.
+    Installation uses a lossless TOML syntax-tree edit because ``codex mcp add``
+    replaces the full server subtree, including user-owned environment and tool
+    policy settings. Uninstall intentionally removes the full entry via Codex.
     """
-    codex = _codex_executable()
-    if not codex:
-        if not quiet:
-            print("Skipping Codex MCP server: codex executable not found")
-        return False
-
-    command = [codex, "mcp", "remove" if uninstall else "add", CODEX_MCP_SERVER_KEY]
-    if not uninstall:
+    if uninstall:
+        codex = _codex_executable()
+        if not codex:
+            if not quiet:
+                print("Skipping Codex MCP server removal: codex executable not found")
+            return False
+        environment = os.environ.copy()
+        environment["CODEX_HOME"] = _codex_home(codex_home)
+        result = subprocess.run(
+            [codex, "mcp", "remove", CODEX_MCP_SERVER_KEY],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        output = "\n".join(
+            value.strip() for value in (result.stdout, result.stderr) if value.strip()
+        )
+        if result.returncode != 0:
+            if "not found" in output.lower():
+                return False
+            raise RuntimeError(f"Codex MCP removal failed (exit {result.returncode}): {output}")
+    else:
         bridge_python = os.path.abspath(ensure_local_venv())
+        _ensure_codex_config_editor_runtime(bridge_python)
         host_python = _binary_ninja_python()
         _validate_codex_runtime(host_python, bridge_python)
-        command.extend(
-            [
-                "--",
-                host_python,
-                _headless_entrypoint(),
-                "--bridge-python",
-                bridge_python,
-            ]
+        codex = _codex_executable()
+        server_args = [
+            _headless_entrypoint(),
+            "--bridge-python",
+            bridge_python,
+        ]
+        _configure_codex_mcp_entry(
+            bridge_python,
+            host_python,
+            server_args,
+            codex_home,
+            codex,
         )
-
-    environment = os.environ.copy()
-    if codex_home:
-        environment["CODEX_HOME"] = os.path.abspath(os.path.expanduser(codex_home))
-    result = subprocess.run(
-        command,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    output = "\n".join(
-        value.strip() for value in (result.stdout, result.stderr) if value.strip()
-    )
-    if result.returncode != 0:
-        if uninstall and "not found" in output.lower():
-            return False
-        raise RuntimeError(
-            f"Codex MCP configuration failed (exit {result.returncode}): {output}"
-        )
+        _validate_codex_registration(codex_home)
 
     if not quiet:
         action = "Uninstalled" if uninstall else "Installed"

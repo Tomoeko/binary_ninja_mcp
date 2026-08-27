@@ -14,6 +14,7 @@ import base64 as _base64
 import contextvars as _contextvars
 import functools as _functools
 import inspect as _inspect
+import math as _math
 import os as _os
 import threading as _threading
 import time as _time
@@ -33,9 +34,69 @@ _binja_auth_token = _os.environ.get("BINJA_MCP_AUTH_TOKEN", "")
 binja_server_url = f"http://{_binja_host}:{_binja_port}"
 mcp = FastMCP("binja-mcp")
 _target_binary = _contextvars.ContextVar("binary_ninja_mcp_target", default="")
-_http = requests.Session()
-# Authenticated loopback traffic must not inherit HTTP_PROXY/ALL_PROXY.
-_http.trust_env = False
+
+
+def _positive_timeout_from_env(name: str, default: float) -> float:
+    raw_value = _os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a positive number, got {raw_value!r}") from exc
+    if not _math.isfinite(value) or value <= 0:
+        raise RuntimeError(f"{name} must be a positive finite number, got {raw_value!r}")
+    return value
+
+
+_HTTP_CONNECT_TIMEOUT_SEC = _positive_timeout_from_env("BINJA_MCP_HTTP_CONNECT_TIMEOUT_SEC", 5.0)
+# Leave one minute for MCP response serialization inside Codex's installed
+# 30-minute tool wait budget. This is an inactivity timeout in requests, not a
+# deadline for Binary Ninja analysis itself.
+_HTTP_READ_TIMEOUT_SEC = _positive_timeout_from_env("BINJA_MCP_HTTP_READ_TIMEOUT_SEC", 1740.0)
+_DEFAULT_HTTP_TIMEOUT = (_HTTP_CONNECT_TIMEOUT_SEC, _HTTP_READ_TIMEOUT_SEC)
+
+
+class _ThreadLocalHttpClient:
+    """Give each MCP worker its own requests session.
+
+    FastMCP may execute synchronous tools on several worker threads. A shared
+    ``requests.Session`` is mutable and is not a request-isolation boundary, so
+    keeping it global makes otherwise independent agents share connection and
+    cookie state. The wrapper retains the small verb-based interface used by
+    the bridge and creates one proxy-free session per worker thread.
+    """
+
+    def __init__(self, session_factory=requests.Session):
+        self._local = _threading.local()
+        self._session_factory = session_factory
+
+    @property
+    def trust_env(self) -> bool:
+        """Expose the effective policy for diagnostics and compatibility tests."""
+        return False
+
+    def _session(self):
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = self._session_factory()
+            # Authenticated loopback traffic must not inherit
+            # HTTP_PROXY/HTTPS_PROXY/ALL_PROXY.
+            session.trust_env = False
+            self._local.session = session
+        return session
+
+    def get(self, *args, **kwargs):
+        return self._session().get(*args, **kwargs)
+
+    def post(self, *args, **kwargs):
+        return self._session().post(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        return self._session().delete(*args, **kwargs)
+
+
+_http = _ThreadLocalHttpClient()
 _mutating_get_endpoints = frozenset(
     {
         "declareCType",
@@ -52,10 +113,23 @@ _mutating_get_endpoints = frozenset(
 )
 
 
-def _effective_timeout(endpoint: str, requested: float | None) -> float | None:
-    """Never abandon a queued mutation that may execute after a timeout."""
-    if endpoint.strip("/") in _mutating_get_endpoints:
-        return None
+def _effective_timeout(
+    endpoint: str,
+    requested: float | tuple[float, float | None] | None,
+) -> float | tuple[float, float | None]:
+    """Give accepted operations a long, finite response-read budget.
+
+    The Binary Ninja host serializes access to mutable analysis state. Under
+    concurrent agents, a healthy request can therefore wait behind a long
+    decompile or IL operation. A scalar requests timeout applies to both
+    connect and response reads, so the old five-second default abandoned these
+    queued requests while they were still live in the host. Keep loopback
+    connection setup bounded and allow queued work to finish within the MCP
+    client's configured wait budget. Mutations always use this long policy
+    because retrying an early-abandoned mutation can apply it twice.
+    """
+    if requested is None or endpoint.strip("/") in _mutating_get_endpoints:
+        return _DEFAULT_HTTP_TIMEOUT
     return requested
 
 
@@ -191,7 +265,11 @@ def _active_filename() -> str:
     return "(none)"
 
 
-def safe_get(endpoint: str, params: dict | None = None, timeout: float | None = 5) -> list:
+def safe_get(
+    endpoint: str,
+    params: dict | None = None,
+    timeout: float | tuple[float, float | None] | None = None,
+) -> list:
     """
     Perform a GET request. If 'params' is given, we convert it to a query string.
     """
@@ -201,15 +279,12 @@ def safe_get(endpoint: str, params: dict | None = None, timeout: float | None = 
     url = f"{binja_server_url}/{endpoint}"
 
     try:
-        if timeout is None:
-            response = _http.get(url, params=params, headers=_request_headers())
-        else:
-            response = _http.get(
-                url,
-                params=params,
-                headers=_request_headers(),
-                timeout=timeout,
-            )
+        response = _http.get(
+            url,
+            params=params,
+            headers=_request_headers(),
+            timeout=timeout,
+        )
         response.encoding = "utf-8"
         if response.ok:
             return response.text.splitlines()
@@ -219,7 +294,11 @@ def safe_get(endpoint: str, params: dict | None = None, timeout: float | None = 
         return [f"Request failed: {e!s}"]
 
 
-def get_json(endpoint: str, params: dict | None = None, timeout: float | None = 5):
+def get_json(
+    endpoint: str,
+    params: dict | None = None,
+    timeout: float | tuple[float, float | None] | None = None,
+):
     """
     Perform a GET and return parsed JSON.
     - On 2xx: returns parsed JSON.
@@ -231,15 +310,12 @@ def get_json(endpoint: str, params: dict | None = None, timeout: float | None = 
     timeout = _effective_timeout(endpoint, timeout)
     url = f"{binja_server_url}/{endpoint}"
     try:
-        if timeout is None:
-            response = _http.get(url, params=params, headers=_request_headers())
-        else:
-            response = _http.get(
-                url,
-                params=params,
-                headers=_request_headers(),
-                timeout=timeout,
-            )
+        response = _http.get(
+            url,
+            params=params,
+            headers=_request_headers(),
+            timeout=timeout,
+        )
         response.encoding = "utf-8"
         # Try to parse JSON regardless of status
         try:
@@ -261,22 +337,23 @@ def get_json(endpoint: str, params: dict | None = None, timeout: float | None = 
         return {"error": f"Request failed: {e!s}"}
 
 
-def get_text(endpoint: str, params: dict | None = None, timeout: float | None = 5) -> str:
+def get_text(
+    endpoint: str,
+    params: dict | None = None,
+    timeout: float | tuple[float, float | None] | None = None,
+) -> str:
     """Perform a GET and return raw text (or an error string)."""
     if params is None:
         params = {}
     timeout = _effective_timeout(endpoint, timeout)
     url = f"{binja_server_url}/{endpoint}"
     try:
-        if timeout is None:
-            response = _http.get(url, params=params, headers=_request_headers())
-        else:
-            response = _http.get(
-                url,
-                params=params,
-                headers=_request_headers(),
-                timeout=timeout,
-            )
+        response = _http.get(
+            url,
+            params=params,
+            headers=_request_headers(),
+            timeout=timeout,
+        )
         response.encoding = "utf-8"
         if response.ok:
             return response.text
@@ -288,17 +365,20 @@ def get_text(endpoint: str, params: dict | None = None, timeout: float | None = 
 
 def safe_post(endpoint: str, data: dict | str) -> str:
     try:
+        timeout = _effective_timeout(endpoint, None)
         if isinstance(data, dict):
             response = _http.post(
                 f"{binja_server_url}/{endpoint}",
                 data=data,
                 headers=_request_headers(),
+                timeout=timeout,
             )
         else:
             response = _http.post(
                 f"{binja_server_url}/{endpoint}",
                 data=data.encode("utf-8"),
                 headers=_request_headers(),
+                timeout=timeout,
             )
         response.encoding = "utf-8"
         if response.ok:
@@ -316,6 +396,7 @@ def safe_delete(endpoint: str, params: dict | None = None) -> str:
             f"{binja_server_url}/{endpoint}",
             params=params or {},
             headers=_request_headers(),
+            timeout=_effective_timeout(endpoint, None),
         )
         response.encoding = "utf-8"
         if response.ok:
@@ -814,6 +895,7 @@ def open_binary(
             f"{binja_server_url}/load",
             json=payload,
             headers=_request_headers(),
+            timeout=_effective_timeout("load", None),
         )
         try:
             data = response.json()
@@ -827,8 +909,7 @@ def open_binary(
             filename = data.get("filename")
             if selector or filename:
                 message += (
-                    f"\nStable selector: {selector or filename}"
-                    f"\nFull path: {filename or filepath}"
+                    f"\nStable selector: {selector or filename}\nFull path: {filename or filepath}"
                 )
             return message
         if isinstance(data, dict) and data.get("error"):
@@ -853,9 +934,7 @@ def list_binaries() -> list:
     for it in items:
         vid = it.get("id")
         view_id = it.get("view_id")
-        view_selector = it.get("view_selector") or (
-            f"view:{view_id}" if view_id else ""
-        )
+        view_selector = it.get("view_selector") or (f"view:{view_id}" if view_id else "")
         fn = it.get("filename")
         basename = it.get("basename") or ""
         selectors = it.get("selectors") or []

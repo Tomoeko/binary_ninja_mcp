@@ -100,9 +100,7 @@ class BinaryOperations:
             if not os.path.isfile(canonical_path):
                 raise FileNotFoundError(f"Binary does not exist: {canonical_path}")
 
-            allowed_modes = {
-                "basic", "controlFlowGraph", "full", "intermediate", "linearSweep"
-            }
+            allowed_modes = {"basic", "controlFlowGraph", "full", "intermediate", "linearSweep"}
             if analysis_mode not in allowed_modes:
                 raise ValueError(
                     f"Unsupported analysis mode {analysis_mode!r}; expected one of "
@@ -320,7 +318,7 @@ class BinaryOperations:
                 vb_canon = vb
             entries.append((canonical_id, fn, bool(vb_canon is self._current_view)))
         # Sort by filename for stable ordering
-        entries.sort(key=lambda t: (t[1] or ""))
+        entries.sort(key=lambda t: t[1] or "")
         for cid, fn, active in entries:
             items.append({"id": cid, "filename": fn, "active": active})
         return items
@@ -992,9 +990,11 @@ class BinaryOperations:
         if not func:
             return None
 
-        # analyze func in case it was skipped
+        # Re-enable a function that Binary Ninja skipped, then request its HLIL
+        # below. Function IL properties generate their own IL on demand; waiting
+        # for the entire BinaryView here turns one decompile into a full-database
+        # barrier and blocks every other MCP request behind the host lock.
         func.analysis_skipped = False
-        self._current_view.update_analysis_and_wait()
 
         try:
             il = getattr(func, "hlil", None)
@@ -1056,10 +1056,11 @@ class BinaryOperations:
         if not func:
             return None
 
-        # Ensure analysis has run for this function
+        # Re-enable skipped analysis. Accessing the selected IL property below
+        # generates that function's IL on demand, without waiting for unrelated
+        # BinaryView analysis to finish.
         try:
             func.analysis_skipped = False
-            self._current_view.update_analysis_and_wait()
         except Exception:
             pass
 
