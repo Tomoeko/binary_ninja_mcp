@@ -259,21 +259,29 @@ class LauncherTests(unittest.TestCase):
         process.terminate.assert_not_called()
         process.kill.assert_not_called()
 
-    def test_launcher_passes_reported_port_and_token_to_bridge(self):
-        host = mock.Mock(pid=123)
+    def test_launcher_starts_only_a_lazy_bridge_and_does_not_inherit_the_lease(self):
         bridge = mock.Mock(pid=456)
-        endpoint = launcher.HostEndpoint("127.0.0.1", 45678, "instance-a")
+        bridge.wait.return_value = 0
+        config = mock.Mock()
+        lease = mock.Mock()
         with (
             mock.patch.object(launcher, "resolve_executable", return_value="/host/python"),
-            mock.patch.object(launcher, "host_environment", return_value={}),
             mock.patch.object(launcher, "find_bridge_python", return_value="/bridge/python"),
+            mock.patch.object(
+                launcher.shared_host,
+                "build_shared_host_config",
+                return_value=config,
+            ) as build_config,
+            mock.patch.object(
+                launcher.shared_host,
+                "create_client_lease",
+                return_value=lease,
+            ),
             mock.patch.object(
                 launcher.subprocess,
                 "Popen",
-                side_effect=[host, bridge],
+                return_value=bridge,
             ) as popen,
-            mock.patch.object(launcher, "wait_for_host", return_value=endpoint),
-            mock.patch.object(launcher, "supervise_processes", return_value=0),
             mock.patch.object(launcher, "stop_process"),
         ):
             result = launcher.main(
@@ -285,16 +293,16 @@ class LauncherTests(unittest.TestCase):
                     "--bridge-python",
                     "/bridge/python",
                 ]
-            )
+        )
         self.assertEqual(result, 0)
-        host_call, bridge_call = popen.call_args_list
-        self.assertIn("0", host_call.args[0])
-        self.assertIn("--ready-file", host_call.args[0])
-        self.assertEqual(host_call.kwargs["stdin"], launcher.subprocess.PIPE)
-        self.assertEqual(bridge_call.kwargs["env"]["BINJA_MCP_PORT"], "45678")
-        self.assertEqual(bridge_call.kwargs["env"]["BINJA_MCP_INSTANCE_ID"], "instance-a")
-        self.assertTrue(bridge_call.kwargs["env"]["BINJA_MCP_AUTH_TOKEN"])
+        build_config.assert_called_once()
+        config.to_environment.assert_called_once()
+        popen.assert_called_once()
+        bridge_call = popen.call_args
+        self.assertTrue(bridge_call.kwargs["close_fds"])
         self.assertEqual(bridge_call.kwargs["env"]["BINJA_MCP_PARENT_PID"], str(os.getpid()))
+        bridge.wait.assert_called_once_with()
+        lease.close.assert_called_once_with()
 
     def test_supervisor_stops_bridge_when_host_exits(self):
         host = mock.Mock()

@@ -13,6 +13,9 @@ import uuid
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from shared_host import SharedHostRuntime, monitor_shared_host_lifetime  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,6 +30,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--exit-on-stdin-eof",
         action="store_true",
         help="stop when the launcher closes the private stdin liveness pipe",
+    )
+    parser.add_argument(
+        "--lease-directory",
+        help="private shared-host directory containing locked client leases",
+    )
+    parser.add_argument(
+        "--shared-state-file",
+        help="private registry record used to detect host supersession",
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=60.0,
+        help="seconds to retain a shared host after its final client exits",
+    )
+    parser.add_argument(
+        "--claim-timeout",
+        type=float,
+        default=30.0,
+        help="seconds a new shared host waits to be published in the registry",
     )
     parser.add_argument(
         "--binary",
@@ -92,6 +115,12 @@ def validate_runtime(bn) -> tuple[list[str], list[str], list[str]]:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if bool(args.lease_directory) != bool(args.shared_state_file):
+        raise RuntimeError(
+            "--lease-directory and --shared-state-file must be supplied together"
+        )
+    if args.idle_timeout <= 0 or args.claim_timeout <= 0:
+        raise RuntimeError("--idle-timeout and --claim-timeout must be positive")
 
     stopping = threading.Event()
 
@@ -143,10 +172,17 @@ def main(argv: list[str] | None = None) -> int:
     config.server.port = args.port
     instance_id = os.environ.get("BINJA_MCP_INSTANCE_ID") or uuid.uuid4().hex
     auth_token = os.environ.get("BINJA_MCP_AUTH_TOKEN") or None
+    shared_runtime = SharedHostRuntime.from_environment()
+
+    def journal_loaded_binary(payload: dict[str, object], view_id: str | int) -> None:
+        if shared_runtime is not None:
+            shared_runtime.remember_binary_for_instance(instance_id, payload, view_id)
+
     server = MCPServer(
         config,
         instance_id=instance_id,
         auth_token=auth_token,
+        binary_loaded_callback=journal_loaded_binary if shared_runtime is not None else None,
     )
 
     try:
@@ -172,6 +208,20 @@ def main(argv: list[str] | None = None) -> int:
                     "port": bound_port,
                 },
             )
+        if args.lease_directory and args.shared_state_file:
+            threading.Thread(
+                target=monitor_shared_host_lifetime,
+                args=(
+                    stopping,
+                    Path(args.lease_directory),
+                    Path(args.shared_state_file),
+                    instance_id,
+                    args.idle_timeout,
+                    args.claim_timeout,
+                ),
+                daemon=True,
+                name="binary-ninja-mcp-shared-lifetime",
+            ).start()
         print(
             f"Binary Ninja headless HTTP service ready at http://{args.host}:{bound_port}",
             file=sys.stderr,

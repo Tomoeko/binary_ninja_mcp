@@ -7,7 +7,6 @@ import argparse
 import base64
 import json
 import os
-import secrets
 import shutil
 import subprocess
 import sys
@@ -19,6 +18,10 @@ from pathlib import Path
 from typing import NamedTuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "bridge"))
+
+import shared_host  # noqa: E402
+
 DEFAULT_BN_PYTHON = Path("/Applications/Binary Ninja.app/Contents/Resources/python")
 # Local authenticated control traffic must never inherit HTTP_PROXY/ALL_PROXY.
 # Besides breaking loopback startup, doing so could disclose the per-launch
@@ -334,87 +337,65 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     host_python = resolve_executable(args.python)
     bn_python_path = Path(args.bn_python_path).expanduser().resolve()
-    with tempfile.TemporaryDirectory(prefix="binary-ninja-mcp-") as runtime_directory:
-        runtime_path = Path(runtime_directory)
-        env = host_environment(bn_python_path)
-        prepare_isolated_user_directory(
-            env,
-            runtime_path / "binary-ninja-user",
-        )
-        host_command = [
-            host_python,
-            str(REPO_ROOT / "bridge" / "headless_host.py"),
-            "--host",
-            args.host,
-            "--port",
-            str(args.port),
-        ]
-        for binary in args.binary:
-            host_command.extend(["--binary", str(Path(binary).expanduser().resolve())])
-        if args.check:
-            host_command.append("--check")
-            return subprocess.run(host_command, env=env, check=False).returncode
 
+    if args.check:
+        with tempfile.TemporaryDirectory(prefix="binary-ninja-mcp-check-") as directory:
+            environment = host_environment(bn_python_path)
+            prepare_isolated_user_directory(
+                environment,
+                Path(directory) / "binary-ninja-user",
+            )
+            return subprocess.run(
+                [
+                    host_python,
+                    str(REPO_ROOT / "bridge" / "headless_host.py"),
+                    "--host",
+                    args.host,
+                    "--port",
+                    str(args.port),
+                    "--check",
+                ],
+                env=environment,
+                check=False,
+            ).returncode
+
+    bridge_process: subprocess.Popen | None = None
+    lease: shared_host.ClientLease | None = None
+    try:
+        # Codex creates one stdio MCP process per task.  Keep that process
+        # lightweight: the first actual analysis call creates the native host,
+        # while every launcher lease points at the same private registry.
+        config = shared_host.build_shared_host_config(
+            host_python=host_python,
+            bn_python_path=bn_python_path,
+            bind_host=args.host,
+            bind_port=args.port,
+            startup_timeout=args.startup_timeout,
+            startup_binaries=args.binary,
+        )
+        lease = shared_host.create_client_lease(config)
         bridge_python = find_bridge_python(args.bridge_python)
-        host_process: subprocess.Popen | None = None
-        bridge_process: subprocess.Popen | None = None
-        instance_id = secrets.token_hex(16)
-        auth_token = secrets.token_urlsafe(32)
-        ready_file = runtime_path / "host-ready.json"
-        host_command.extend(
-            [
-                "--ready-file",
-                str(ready_file),
-                "--exit-on-stdin-eof",
-            ]
+        bridge_env = os.environ.copy()
+        config.to_environment(bridge_env)
+        bridge_env["BINJA_MCP_PARENT_PID"] = str(os.getpid())
+        bridge_process = subprocess.Popen(
+            [bridge_python, str(REPO_ROOT / "bridge" / "binja_mcp_bridge.py")],
+            env=bridge_env,
+            stdin=sys.stdin,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            close_fds=True,
         )
-        env["BINJA_MCP_INSTANCE_ID"] = instance_id
-        env["BINJA_MCP_AUTH_TOKEN"] = auth_token
-        try:
-            # Host diagnostics stay on stderr. Its private stdin pipe is held by
-            # this launcher and closes even if the launcher is killed abruptly.
-            host_process = subprocess.Popen(
-                host_command,
-                env=env,
-                stdin=subprocess.PIPE,
-                stdout=sys.stderr,
-                stderr=sys.stderr,
-            )
-            endpoint = wait_for_host(
-                host_process,
-                ready_file,
-                instance_id,
-                args.host,
-                auth_token,
-                args.startup_timeout,
-                require_loaded=bool(args.binary),
-                target_binary=(
-                    str(Path(args.binary[0]).expanduser().resolve()) if args.binary else None
-                ),
-            )
-
-            bridge_env = os.environ.copy()
-            bridge_env["BINJA_MCP_HOST"] = endpoint.host
-            bridge_env["BINJA_MCP_PORT"] = str(endpoint.port)
-            bridge_env["BINJA_MCP_INSTANCE_ID"] = endpoint.instance_id
-            bridge_env["BINJA_MCP_AUTH_TOKEN"] = auth_token
-            bridge_env["BINJA_MCP_PARENT_PID"] = str(os.getpid())
-            bridge_process = subprocess.Popen(
-                [bridge_python, str(REPO_ROOT / "bridge" / "binja_mcp_bridge.py")],
-                env=bridge_env,
-                stdin=sys.stdin,
-                stdout=sys.stdout,
-                stderr=sys.stderr,
-            )
-            return supervise_processes(host_process, bridge_process)
-        except KeyboardInterrupt:
-            return 130
-        except Exception as exc:
-            print(f"Headless Binary Ninja MCP startup failed: {exc}", file=sys.stderr)
-            return 1
-        finally:
-            stop_process(bridge_process)
-            stop_process(host_process)
+        return bridge_process.wait()
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        print(f"Headless Binary Ninja MCP startup failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        stop_process(bridge_process)
+        if lease is not None:
+            lease.close()
 
 
 if __name__ == "__main__":

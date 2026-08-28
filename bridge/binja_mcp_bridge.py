@@ -18,8 +18,17 @@ import math as _math
 import os as _os
 import threading as _threading
 import time as _time
+from typing import NamedTuple as _NamedTuple
 
 import requests
+
+try:
+    from shared_host import SharedHostRuntime as _SharedHostRuntime
+except ModuleNotFoundError:
+    # ``importlib.util.spec_from_file_location`` (used by tests and some MCP
+    # clients) does not automatically add this script's directory to sys.path.
+    _sys.path.insert(0, _os.path.dirname(_os.path.realpath(__file__)))
+    from shared_host import SharedHostRuntime as _SharedHostRuntime
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -34,6 +43,35 @@ _binja_auth_token = _os.environ.get("BINJA_MCP_AUTH_TOKEN", "")
 binja_server_url = f"http://{_binja_host}:{_binja_port}"
 mcp = FastMCP("binja-mcp")
 _target_binary = _contextvars.ContextVar("binary_ninja_mcp_target", default="")
+_shared_host_runtime = _SharedHostRuntime.from_environment()
+
+
+class _HttpEndpoint(_NamedTuple):
+    url: str
+    auth_token: str
+    instance_id: str
+
+
+class _MutationOutcomeUnknown(RuntimeError):
+    """The connection died after a mutation may have reached the old host."""
+
+
+def _endpoint(previous_instance: str = "") -> _HttpEndpoint:
+    if _shared_host_runtime is None:
+        return _HttpEndpoint(binja_server_url, _binja_auth_token, "")
+    record = _shared_host_runtime.ensure_host(previous_instance=previous_instance)
+    return _endpoint_from_record(record)
+
+
+def _endpoint_from_record(record) -> _HttpEndpoint:
+    host = record.endpoint.host
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return _HttpEndpoint(
+        f"http://{host}:{record.endpoint.port}",
+        record.auth_token,
+        record.endpoint.instance_id,
+    )
 
 
 def _positive_timeout_from_env(name: str, default: float) -> float:
@@ -133,10 +171,11 @@ def _effective_timeout(
     return requested
 
 
-def _request_headers() -> dict[str, str]:
+def _request_headers(auth_token: str | None = None) -> dict[str, str]:
     headers: dict[str, str] = {}
-    if _binja_auth_token:
-        headers["X-Binary-Ninja-MCP-Token"] = _binja_auth_token
+    token = _binja_auth_token if auth_token is None else auth_token
+    if token:
+        headers["X-Binary-Ninja-MCP-Token"] = token
     target = _target_binary.get().strip()
     if target:
         # HTTP header values are Latin-1 and reject newlines. Base64url keeps
@@ -145,6 +184,62 @@ def _request_headers() -> dict[str, str]:
             target.encode("utf-8")
         ).decode("ascii")
     return headers
+
+
+def _request(
+    method: str,
+    endpoint: str,
+    *,
+    retry_safe: bool,
+    **kwargs,
+):
+    """Send through the current host and recover only on connection loss.
+
+    A response-read timeout can mean a healthy Binary Ninja operation is still
+    running behind the server's serialization lock, so it never replaces the
+    host.  A connection/reset failure does trigger a new registry generation.
+    Read-only operations and canonical-path ``/load`` may then be replayed;
+    mutations return an explicit unknown-outcome error instead.
+    """
+    current = _endpoint()
+
+    def send(target: _HttpEndpoint):
+        request_kwargs = dict(kwargs)
+        headers = dict(request_kwargs.pop("headers", {}) or {})
+        headers.update(_request_headers(target.auth_token))
+        return getattr(_http, method.lower())(
+            f"{target.url}/{endpoint.lstrip('/')}",
+            headers=headers,
+            **request_kwargs,
+        )
+
+    try:
+        return send(current)
+    except requests.exceptions.ReadTimeout as exc:
+        if retry_safe:
+            raise
+        raise _MutationOutcomeUnknown(
+            "Timed out waiting for Binary Ninja after the mutation may have been "
+            "accepted. The host was not replaced and this mutation was not replayed; "
+            "its outcome is unknown. Inspect the target before retrying."
+        ) from exc
+    except (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.ConnectTimeout,
+        requests.exceptions.ChunkedEncodingError,
+    ) as exc:
+        if _shared_host_runtime is None:
+            raise
+        replacement = _endpoint_from_record(
+            _shared_host_runtime.recover_after_connection_loss(current.instance_id)
+        )
+        if retry_safe:
+            return send(replacement)
+        raise _MutationOutcomeUnknown(
+            "Binary Ninja host connection was lost after the request may have been "
+            "accepted. The shared host recovered, but this mutation was not replayed; "
+            "its outcome is unknown. Inspect the target before retrying."
+        ) from exc
 
 
 _raw_mcp_tool = mcp.tool
@@ -276,13 +371,12 @@ def safe_get(
     if params is None:
         params = {}
     timeout = _effective_timeout(endpoint, timeout)
-    url = f"{binja_server_url}/{endpoint}"
-
     try:
-        response = _http.get(
-            url,
+        response = _request(
+            "get",
+            endpoint,
+            retry_safe=endpoint.strip("/") not in _mutating_get_endpoints,
             params=params,
-            headers=_request_headers(),
             timeout=timeout,
         )
         response.encoding = "utf-8"
@@ -308,12 +402,12 @@ def get_json(
     if params is None:
         params = {}
     timeout = _effective_timeout(endpoint, timeout)
-    url = f"{binja_server_url}/{endpoint}"
     try:
-        response = _http.get(
-            url,
+        response = _request(
+            "get",
+            endpoint,
+            retry_safe=endpoint.strip("/") not in _mutating_get_endpoints,
             params=params,
-            headers=_request_headers(),
             timeout=timeout,
         )
         response.encoding = "utf-8"
@@ -346,12 +440,12 @@ def get_text(
     if params is None:
         params = {}
     timeout = _effective_timeout(endpoint, timeout)
-    url = f"{binja_server_url}/{endpoint}"
     try:
-        response = _http.get(
-            url,
+        response = _request(
+            "get",
+            endpoint,
+            retry_safe=endpoint.strip("/") not in _mutating_get_endpoints,
             params=params,
-            headers=_request_headers(),
             timeout=timeout,
         )
         response.encoding = "utf-8"
@@ -367,17 +461,19 @@ def safe_post(endpoint: str, data: dict | str) -> str:
     try:
         timeout = _effective_timeout(endpoint, None)
         if isinstance(data, dict):
-            response = _http.post(
-                f"{binja_server_url}/{endpoint}",
+            response = _request(
+                "post",
+                endpoint,
+                retry_safe=False,
                 data=data,
-                headers=_request_headers(),
                 timeout=timeout,
             )
         else:
-            response = _http.post(
-                f"{binja_server_url}/{endpoint}",
+            response = _request(
+                "post",
+                endpoint,
+                retry_safe=False,
                 data=data.encode("utf-8"),
-                headers=_request_headers(),
                 timeout=timeout,
             )
         response.encoding = "utf-8"
@@ -392,10 +488,11 @@ def safe_post(endpoint: str, data: dict | str) -> str:
 def safe_delete(endpoint: str, params: dict | None = None) -> str:
     """Perform a DELETE request and return raw text (or an error string)."""
     try:
-        response = _http.delete(
-            f"{binja_server_url}/{endpoint}",
+        response = _request(
+            "delete",
+            endpoint,
+            retry_safe=False,
             params=params or {},
-            headers=_request_headers(),
             timeout=_effective_timeout(endpoint, None),
         )
         response.encoding = "utf-8"
@@ -891,10 +988,11 @@ def open_binary(
             "platform": platform,
             "image_base": image_base,
         }
-        response = _http.post(
-            f"{binja_server_url}/load",
+        response = _request(
+            "post",
+            "load",
+            retry_safe=True,
             json=payload,
-            headers=_request_headers(),
             timeout=_effective_timeout("load", None),
         )
         try:

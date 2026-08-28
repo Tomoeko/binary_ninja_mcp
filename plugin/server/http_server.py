@@ -2,9 +2,11 @@ import base64
 import binascii
 import hmac
 import json
+import os
 import threading
 import urllib.parse
 import uuid
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -24,6 +26,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
     operation_lock = None  # Serializes access to Binary Ninja's mutable analysis state
     instance_id = None
     auth_token = None
+    binary_loaded_callback = None
     _target_free_paths = frozenset(
         {
             "/binaries",
@@ -50,14 +53,25 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         bn.log_info(format % args)
 
-    def _set_headers(self, content_type="application/json", status_code=200):
+    def _set_headers(
+        self,
+        *,
+        content_type: str,
+        content_length: int,
+        status_code: int,
+    ) -> bool:
         try:
             self.send_response(status_code)
             self.send_header("Content-Type", content_type)
+            # Every response is length-framed. If the native host dies after
+            # sending headers, requests raises an incomplete-read error rather
+            # than accepting a truncated close-delimited body as complete.
+            self.send_header("Content-Length", str(content_length))
             self.send_header("Access-Control-Allow-Origin", "*")
             # Encourage clients to close promptly; reduces BrokenPipe on abrupt disconnects
             self.send_header("Connection", "close")
             self.end_headers()
+            return True
         except (BrokenPipeError, OSError):
             try:
                 import binaryninja as _bn
@@ -65,15 +79,22 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 _bn.log_warn("Client disconnected while sending headers")
             except Exception:
                 pass
+            return False
 
-    def _send_json_response(self, data: dict[str, Any], status_code: int = 200):
+    def _send_response_body(
+        self,
+        body: bytes,
+        *,
+        content_type: str,
+        status_code: int,
+    ) -> None:
         try:
-            self._set_headers(status_code=status_code)
-            # If headers failed due to disconnect, avoid writing body
-            try:
-                body = json.dumps(data).encode("utf-8")
-            except Exception:
-                body = b"{}"
+            if not self._set_headers(
+                content_type=content_type,
+                content_length=len(body),
+                status_code=status_code,
+            ):
+                return
             try:
                 self.wfile.write(body)
             except (BrokenPipeError, OSError):
@@ -91,6 +112,25 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 _bn.log_debug("Suppressed exception during response write")
             except Exception:
                 pass
+
+    def _send_json_response(self, data: Any, status_code: int = 200) -> None:
+        try:
+            body = json.dumps(data).encode("utf-8")
+        except Exception:
+            body = b"{}"
+        self._send_response_body(
+            body,
+            content_type="application/json",
+            status_code=status_code,
+        )
+
+    def _send_text_response(self, data: str | bytes, status_code: int = 200) -> None:
+        body = data if isinstance(data, bytes) else data.encode("utf-8", errors="replace")
+        self._send_response_body(
+            body,
+            content_type="text/plain",
+            status_code=status_code,
+        )
 
     def _parse_query_params(self) -> dict[str, str]:
         parsed_path = urllib.parse.urlparse(self.path)
@@ -256,12 +296,8 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
     def _prepare_request(self) -> bool:
         """Authenticate the caller and bind this request to an explicit view."""
-        expected_token = self.auth_token
-        if expected_token:
-            supplied_token = self.headers.get("X-Binary-Ninja-MCP-Token", "")
-            if not hmac.compare_digest(str(expected_token), supplied_token):
-                self._send_json_response({"error": "Unauthorized MCP request"}, 403)
-                return False
+        if not self._authenticate_request():
+            return False
 
         encoded_target = self.headers.get("X-Binary-Ninja-View-B64", "").strip()
         if encoded_target:
@@ -316,6 +352,16 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _authenticate_request(self) -> bool:
+        """Authenticate without touching Binary Ninja's mutable analysis state."""
+        expected_token = self.auth_token
+        if expected_token:
+            supplied_token = self.headers.get("X-Binary-Ninja-MCP-Token", "")
+            if not hmac.compare_digest(str(expected_token), supplied_token):
+                self._send_json_response({"error": "Unauthorized MCP request"}, 403)
+                return False
+        return True
+
     @classmethod
     def _requires_explicit_target(cls, path: str) -> bool:
         """Return whether a multi-view request must name its BinaryView."""
@@ -323,6 +369,19 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         """Keep each parsed Binary Ninja operation atomic within this host."""
+        # This authenticated liveness check intentionally bypasses the Binary
+        # Ninja operation lock. A decompile may hold that lock for minutes and
+        # must not look like a dead host to another MCP bridge.
+        if urllib.parse.urlparse(self.path).path == "/health":
+            if self._authenticate_request():
+                self._send_json_response(
+                    {
+                        "protocol": 1,
+                        "instance_id": self.instance_id,
+                        "pid": os.getpid(),
+                    }
+                )
+            return
         lock = self.operation_lock
         if lock is None:
             return self._do_GET()
@@ -549,8 +608,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 try:
                     address_str = params.get("address")
                     if not address_str:
-                        self._set_headers(content_type="text/plain", status_code=400)
-                        self.wfile.write(b"Missing address parameter\n")
+                        self._send_text_response("Missing address parameter\n", 400)
                         return
                     # Parse address
                     try:
@@ -565,8 +623,10 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                             )
                         )
                     except Exception:
-                        self._set_headers(content_type="text/plain", status_code=400)
-                        self.wfile.write(b"Invalid address format; use hex like 0x401000\n")
+                        self._send_text_response(
+                            "Invalid address format; use hex like 0x401000\n",
+                            400,
+                        )
                         return
 
                     # Determine length
@@ -648,25 +708,21 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                         offset += take
 
                     text = "\n".join(lines) + "\n"
-                    self._set_headers(content_type="text/plain", status_code=200)
-                    self.wfile.write(text.encode("utf-8", errors="replace"))
+                    self._send_text_response(text)
                 except Exception as e:
                     bn.log_error(f"Error handling hexdump: {e}")
-                    self._set_headers(content_type="text/plain", status_code=500)
-                    self.wfile.write(f"Error: {e}\n".encode())
+                    self._send_text_response(f"Error: {e}\n", 500)
 
             elif path == "/hexdumpByName":
                 try:
                     name = params.get("name") or params.get("symbol") or params.get("raw_name")
                     if not name:
-                        self._set_headers(content_type="text/plain", status_code=400)
-                        self.wfile.write(b"Missing name parameter\n")
+                        self._send_text_response("Missing name parameter\n", 400)
                         return
 
                     addr, label = self._resolve_name_to_address(name)
                     if addr is None:
-                        self._set_headers(content_type="text/plain", status_code=404)
-                        self.wfile.write(b"Symbol not found\n")
+                        self._send_text_response("Symbol not found\n", 404)
                         return
 
                     # Determine length
@@ -723,12 +779,10 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                         offset += take
 
                     text = "\n".join(lines) + "\n"
-                    self._set_headers(content_type="text/plain", status_code=200)
-                    self.wfile.write(text.encode("utf-8", errors="replace"))
+                    self._send_text_response(text)
                 except Exception as e:
                     bn.log_error(f"Error handling hexdumpByName: {e}")
-                    self._set_headers(content_type="text/plain", status_code=500)
-                    self.wfile.write(f"Error: {e}\n".encode())
+                    self._send_text_response(f"Error: {e}\n", 500)
 
             elif path == "/getDataDecl":
                 try:
@@ -2062,6 +2116,31 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                         image_base=image_base,
                     )
                     view_id = self.binary_ops.register_view(view)
+                    expected_view_id = params.get("view_id")
+                    if expected_view_id is not None and str(expected_view_id) != str(view_id):
+                        raise RuntimeError(
+                            "Binary Ninja recovery changed a stable view id: "
+                            f"expected view:{expected_view_id}, got view:{view_id}"
+                        )
+                    callback = self.binary_loaded_callback
+                    if callback is not None:
+                        # Journal the stable selector before success is visible to
+                        # the bridge. If persistence fails, /load returns an error;
+                        # a retry is safe because load_binary deduplicates by the
+                        # canonical path and can journal the already-open view.
+                        callback(
+                            {
+                                "filepath": str(filepath),
+                                "analysis_mode": analysis_mode,
+                                "platform": str(platform_name) if platform_name else "",
+                                "image_base": (
+                                    str(image_base_value)
+                                    if image_base_value not in (None, "")
+                                    else ""
+                                ),
+                            },
+                            view_id,
+                        )
                     self._send_json_response(
                         {
                             "success": True,
@@ -2512,12 +2591,14 @@ class MCPServer:
         *,
         instance_id: str | None = None,
         auth_token: str | None = None,
+        binary_loaded_callback: Callable[[dict[str, object], str | int], None] | None = None,
     ):
         self.config = config
         self.server = None
         self.thread = None
         self.instance_id = instance_id or uuid.uuid4().hex
         self.auth_token = auth_token
+        self.binary_loaded_callback = binary_loaded_callback
         self.operation_lock = threading.RLock()
         self.binary_ops = BinaryOperations(
             config.binary_ninja,
@@ -2537,6 +2618,14 @@ class MCPServer:
                 "operation_lock": self.operation_lock,
                 "instance_id": self.instance_id,
                 "auth_token": self.auth_token,
+                # Plain functions stored on a class are descriptors. Without
+                # staticmethod, accessing this through a request handler binds
+                # the handler as an unexpected third callback argument.
+                "binary_loaded_callback": (
+                    staticmethod(self.binary_loaded_callback)
+                    if self.binary_loaded_callback is not None
+                    else None
+                ),
             },
         )
 

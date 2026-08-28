@@ -7,6 +7,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import requests
@@ -319,6 +320,182 @@ class BridgeTargetingTests(unittest.TestCase):
         self.assertEqual(len(created), 2)
         self.assertEqual(len({id(session) for session in observed}), 2)
         self.assertTrue(all(session.trust_env is False for session in created))
+
+    def _host_record(self, instance: str, port: int):
+        return SimpleNamespace(
+            endpoint=SimpleNamespace(
+                host="127.0.0.1",
+                port=port,
+                instance_id=instance,
+            ),
+            auth_token=f"token-{instance}",
+        )
+
+    def _start_http_server(self, handler_class):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def test_declared_partial_read_retries_against_recovered_host(self):
+        truncated_hits: list[str] = []
+        recovered_hits: list[str] = []
+
+        class TruncatedHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                truncated_hits.append(self.path)
+                partial = b'{"loaded":'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(partial) + 20))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(partial)
+                self.wfile.flush()
+                self.close_connection = True
+
+        class RecoveredHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                recovered_hits.append(self.path)
+                body = json.dumps({"loaded": False, "instance_id": "new"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+        truncated_server = self._start_http_server(TruncatedHandler)
+        recovered_server = self._start_http_server(RecoveredHandler)
+        old = self._host_record("old", truncated_server.server_address[1])
+        new = self._host_record("new", recovered_server.server_address[1])
+        runtime = mock.Mock()
+        runtime.ensure_host.return_value = old
+        runtime.recover_after_connection_loss.return_value = new
+
+        with mock.patch.object(self.bridge, "_shared_host_runtime", runtime):
+            result = self.bridge.get_json("status")
+
+        self.assertEqual(result, {"loaded": False, "instance_id": "new"})
+        self.assertEqual(truncated_hits, ["/status"])
+        self.assertEqual(recovered_hits, ["/status"])
+        runtime.recover_after_connection_loss.assert_called_once_with("old")
+
+    def test_declared_partial_mutation_is_unknown_and_never_replayed(self):
+        truncated_hits: list[str] = []
+        replacement_hits: list[str] = []
+
+        class TruncatedHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                truncated_hits.append(self.path)
+                partial = b'{"status":'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(partial) + 20))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(partial)
+                self.wfile.flush()
+                self.close_connection = True
+
+        class ReplacementHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                replacement_hits.append(self.path)
+                body = b'{"status":"ok"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        truncated_server = self._start_http_server(TruncatedHandler)
+        replacement_server = self._start_http_server(ReplacementHandler)
+        old = self._host_record("old", truncated_server.server_address[1])
+        new = self._host_record("new", replacement_server.server_address[1])
+        runtime = mock.Mock()
+        runtime.ensure_host.return_value = old
+        runtime.recover_after_connection_loss.return_value = new
+
+        with mock.patch.object(self.bridge, "_shared_host_runtime", runtime):
+            result = self.bridge.get_json("patch", {"address": "0x1000"})
+
+        self.assertIn("outcome is unknown", result["error"])
+        self.assertEqual(len(truncated_hits), 1)
+        self.assertIn("/patch", truncated_hits[0])
+        self.assertEqual(replacement_hits, [])
+        runtime.recover_after_connection_loss.assert_called_once_with("old")
+
+    def test_read_only_reset_retries_without_replacing_a_healthy_generation(self):
+        old = self._host_record("old", 41001)
+        runtime = mock.Mock()
+        runtime.ensure_host.return_value = old
+        runtime.recover_after_connection_loss.return_value = old
+        with (
+            mock.patch.object(self.bridge, "_shared_host_runtime", runtime),
+            mock.patch.object(
+                self.bridge._http,
+                "get",
+                side_effect=[
+                    requests.exceptions.ConnectionError("reset"),
+                    FakeResponse({"loaded": False}),
+                ],
+            ) as get,
+        ):
+            result = self.bridge.get_json("status")
+        self.assertEqual(result, {"loaded": False})
+        self.assertEqual(get.call_count, 2)
+        runtime.recover_after_connection_loss.assert_called_once_with("old")
+        self.assertTrue(all("41001" in call.args[0] for call in get.call_args_list))
+
+    def test_mutation_reset_recovers_transport_but_never_replays(self):
+        old = self._host_record("old", 41001)
+        runtime = mock.Mock()
+        runtime.ensure_host.return_value = old
+        runtime.recover_after_connection_loss.return_value = old
+        with (
+            mock.patch.object(self.bridge, "_shared_host_runtime", runtime),
+            mock.patch.object(
+                self.bridge._http,
+                "get",
+                side_effect=requests.exceptions.ConnectionError("reset"),
+            ) as get,
+        ):
+            result = self.bridge.get_json("patch", {"address": "0x1000"})
+        self.assertIn("outcome is unknown", result["error"])
+        self.assertEqual(get.call_count, 1)
+        runtime.recover_after_connection_loss.assert_called_once_with("old")
+
+    def test_mutation_read_timeout_is_unknown_and_does_not_replace_host(self):
+        old = self._host_record("old", 41001)
+        runtime = mock.Mock()
+        runtime.ensure_host.return_value = old
+        with (
+            mock.patch.object(self.bridge, "_shared_host_runtime", runtime),
+            mock.patch.object(
+                self.bridge._http,
+                "get",
+                side_effect=requests.exceptions.ReadTimeout("slow"),
+            ) as get,
+        ):
+            result = self.bridge.get_json("patch", {"address": "0x1000"})
+        self.assertIn("outcome is unknown", result["error"])
+        self.assertEqual(get.call_count, 1)
+        runtime.recover_after_connection_loss.assert_not_called()
 
 
 if __name__ == "__main__":

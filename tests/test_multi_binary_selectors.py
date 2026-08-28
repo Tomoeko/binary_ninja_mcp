@@ -6,6 +6,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_PACKAGE = "binary_ninja_mcp_selector_fixture"
@@ -349,6 +350,95 @@ class ExplicitTargetGuardTests(unittest.TestCase):
         self.assertTrue(handler._prepare_request())
         self.assertEqual(handler.responses, [])
         self.assertIs(operations.current_view, views[1])
+
+
+class LoadJournalTests(unittest.TestCase):
+    def _handler(self, params: dict[str, object], view_id: str = "7"):
+        events: list[tuple] = []
+        view = types.SimpleNamespace(
+            file=types.SimpleNamespace(filename="/fixtures/target.bin"),
+            platform=types.SimpleNamespace(name="linux-x86_64"),
+            start=0x1000,
+            end=0x2000,
+        )
+        operations = types.SimpleNamespace(
+            load_binary=lambda *_args, **_kwargs: view,
+            register_view=lambda _view: view_id,
+        )
+        handler = server_module.MCPRequestHandler.__new__(server_module.MCPRequestHandler)
+        handler.path = "/load"
+        handler.binary_ops = operations
+        handler._prepare_request = lambda: True
+        handler._parse_post_params = lambda: dict(params)
+        handler._send_json_response = lambda payload, status_code=200: events.append(
+            ("response", status_code, payload)
+        )
+        return handler, events
+
+    def test_load_journal_records_exact_view_id_before_success_response(self):
+        params = {
+            "filepath": "/fixtures/target.bin",
+            "analysis_mode": "full",
+            "platform": "linux-x86_64",
+            "image_base": "0x1000",
+        }
+        handler, events = self._handler(params)
+        handler.binary_loaded_callback = lambda payload, view_id: events.append(
+            ("journal", payload, view_id)
+        )
+
+        handler._do_POST()
+
+        self.assertEqual(events[0], ("journal", params, "7"))
+        self.assertEqual(events[1][0:2], ("response", 200))
+        self.assertEqual(events[1][2]["view_id"], "7")
+
+    def test_load_rejects_shifted_view_id_before_journal_or_success(self):
+        params = {
+            "filepath": "/fixtures/target.bin",
+            "analysis_mode": "basic",
+            "platform": "",
+            "image_base": "",
+            "view_id": 1,
+        }
+        handler, events = self._handler(params, view_id="2")
+        callback = mock.Mock()
+        handler.binary_loaded_callback = callback
+
+        handler._do_POST()
+
+        callback.assert_not_called()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0:2], ("response", 500))
+        self.assertIn("expected view:1, got view:2", events[0][2]["error"])
+
+    def test_server_handler_does_not_descriptor_bind_plain_load_callback(self):
+        events: list[tuple[dict[str, object], str | int]] = []
+
+        def callback(payload: dict[str, object], view_id: str | int) -> None:
+            events.append((payload, view_id))
+
+        server = server_module.MCPServer.__new__(server_module.MCPServer)
+        server.config = types.SimpleNamespace(
+            server=types.SimpleNamespace(host="127.0.0.1", port=0)
+        )
+        server.server = None
+        server.thread = None
+        server.instance_id = "instance-12345678"
+        server.auth_token = "token"
+        server.binary_loaded_callback = callback
+        server.operation_lock = server_module.threading.RLock()
+        server.binary_ops = object()
+
+        server.start()
+        try:
+            handler_class = server.server.RequestHandlerClass
+            handler = handler_class.__new__(handler_class)
+            handler.binary_loaded_callback({"filepath": "/target.bin"}, "7")
+        finally:
+            server.stop()
+
+        self.assertEqual(events, [({"filepath": "/target.bin"}, "7")])
 
 
 if __name__ == "__main__":
