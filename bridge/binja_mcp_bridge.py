@@ -244,6 +244,7 @@ def _request(
 
 _raw_mcp_tool = mcp.tool
 _unscoped_tool_names = {
+    "close_binary",
     "convert_number",
     "list_binaries",
     "list_platforms",
@@ -1010,6 +1011,34 @@ def open_binary(
                     f"\nStable selector: {selector or filename}\nFull path: {filename or filepath}"
                 )
             return message
+        if isinstance(data, dict) and data.get("error"):
+            return f"Error: {data['error']}"
+        return f"Error {response.status_code}: {response.text.strip()}"
+    except Exception as exc:
+        return f"Request failed: {exc}"
+
+
+@scoped_tool()
+def close_binary(view: str, discard: bool = False) -> str:
+    """Release one headless BinaryView and its native analysis memory.
+
+    Use a stable view:N selector or absolute path. Modified views are protected
+    unless discard is explicitly true.
+    """
+    try:
+        response = _request(
+            "post",
+            "close",
+            retry_safe=False,
+            json={"view": view, "discard": discard},
+            timeout=_effective_timeout("close", None),
+        )
+        try:
+            data = response.json()
+        except Exception:
+            data = None
+        if response.ok and isinstance(data, dict):
+            return str(data.get("message") or f"Binary closed: {view}")
         if isinstance(data, dict) and data.get("error"):
             return f"Error: {data['error']}"
         return f"Error {response.status_code}: {response.text.strip()}"

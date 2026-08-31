@@ -37,6 +37,7 @@ test("target-dependent tools expose binary while management tools stay compatibl
   const decompileSchema = inputShape(tools.decompile_function);
   assert.ok(decompileSchema.binary);
   for (const name of [
+    "close_binary",
     "open_binary",
     "list_binaries",
     "select_binary",

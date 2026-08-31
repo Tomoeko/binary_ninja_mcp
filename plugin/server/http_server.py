@@ -3,6 +3,7 @@ import binascii
 import hmac
 import json
 import os
+import sys
 import threading
 import urllib.parse
 import uuid
@@ -15,10 +16,20 @@ from binaryninja.enums import AnalysisState
 from binaryninja.settings import Settings
 
 from ..api.endpoints import BinaryNinjaEndpoints
-from ..core.binary_operations import BinaryOperations
+from ..core.binary_operations import BinaryLoadConflict, BinaryOperations
 from ..core.config import Config
 from ..utils.number_utils import convert_number as util_convert_number
 from ..utils.string_utils import parse_int_or_default
+
+
+def _peak_rss_bytes() -> int | None:
+    try:
+        import resource
+
+        peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        return peak if sys.platform == "darwin" else peak * 1024
+    except (ImportError, OSError, ValueError):
+        return None
 
 
 class MCPRequestHandler(BaseHTTPRequestHandler):
@@ -27,12 +38,15 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
     instance_id = None
     auth_token = None
     binary_loaded_callback = None
+    current_rss_provider = None
     _target_free_paths = frozenset(
         {
             "/binaries",
             "/views",
             "/selectBinary",
             "/load",
+            "/close",
+            "/syncInventory",
             "/convertNumber",
             "/platforms",
         }
@@ -419,9 +433,33 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 view = self.binary_ops.current_view if self.binary_ops else None
                 status = {
                     "instance_id": self.instance_id,
+                    "pid": os.getpid(),
                     "loaded": view is not None,
                     "filename": view.file.filename if view else None,
+                    "managed_view_count": (
+                        self.binary_ops.managed_view_count() if self.binary_ops else 0
+                    ),
+                    "max_open_binaries": (
+                        self.binary_ops.max_owned_views if self.binary_ops else None
+                    ),
+                    "max_rss_mb": self.binary_ops.max_rss_mb if self.binary_ops else None,
+                    "current_rss_bytes": (
+                        self.current_rss_provider()
+                        if self.current_rss_provider is not None
+                        else None
+                    ),
+                    "peak_rss_bytes": _peak_rss_bytes(),
                 }
+                try:
+                    memory_usage = bn.get_memory_usage_info()
+                    status["active_binary_view_objects"] = memory_usage.get(
+                        "Active BinaryView objects"
+                    )
+                    status["active_file_metadata_objects"] = memory_usage.get(
+                        "Active FileMetadata objects"
+                    )
+                except Exception:
+                    pass
                 if view is not None:
                     try:
                         state = view.analysis_info.state
@@ -910,19 +948,8 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                     bn.log_info(
                         f"/strings/filter request: offset={offset}, limit={limit}, pattern={pattern}"
                     )
-                    # Get all strings first, then filter and paginate
-                    all_strings = self.binary_ops.get_strings(0, 2147483647)
-                    if pattern:
-                        pl = pattern.lower()
-                        filtered = [
-                            s
-                            for s in all_strings
-                            if isinstance(s.get("value"), str) and pl in s.get("value", "").lower()
-                        ]
-                    else:
-                        filtered = all_strings
-                    page = filtered[offset : offset + limit]
-                    self._send_json_response({"strings": page, "total": len(filtered)})
+                    page, total = self.binary_ops.search_strings(pattern, offset, limit)
+                    self._send_json_response({"strings": page, "total": total})
                 except Exception as e:
                     bn.log_error(f"Error filtering strings: {e}")
                     self._send_json_response({"error": str(e)}, 500)
@@ -2087,9 +2114,12 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             if not self._prepare_request():
                 return
             path = urllib.parse.urlparse(self.path).path
-            # /load is the bootstrap endpoint for headless sessions, so it must
-            # remain available before a BinaryView exists.
-            if path != "/load" and not self._check_binary_loaded():
+            # Lifecycle endpoints must remain available before a BinaryView
+            # exists so clients can bootstrap or recover deterministically.
+            if (
+                path not in {"/load", "/close", "/syncInventory"}
+                and not self._check_binary_loaded()
+            ):
                 return
 
             params = self._parse_post_params()
@@ -2109,14 +2139,23 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                     image_base = None
                     if image_base_value not in (None, ""):
                         image_base = int(str(image_base_value), 0)
+                    expected_view_id = params.get("view_id")
+                    next_view_id = params.get("next_view_id")
+                    if next_view_id is not None:
+                        self.binary_ops.reserve_next_view_id(next_view_id)
+                    suppress_inventory = str(
+                        params.get("suppress_inventory", "false")
+                    ).strip().lower() in {"1", "true", "yes"}
+                    already_loaded = self.binary_ops.owns_path(str(filepath))
                     view = self.binary_ops.load_binary(
                         filepath,
                         analysis_mode=analysis_mode,
                         platform_name=str(platform_name) if platform_name else None,
                         image_base=image_base,
+                        preferred_view_id=expected_view_id,
+                        persist_inventory=not suppress_inventory,
                     )
                     view_id = self.binary_ops.register_view(view)
-                    expected_view_id = params.get("view_id")
                     if expected_view_id is not None and str(expected_view_id) != str(view_id):
                         raise RuntimeError(
                             "Binary Ninja recovery changed a stable view id: "
@@ -2141,23 +2180,87 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                             },
                             view_id,
                         )
+                    effective = self.binary_ops.owned_view_record(view) or {}
+                    effective_mode = str(effective.get("analysis_mode") or analysis_mode)
                     self._send_json_response(
                         {
                             "success": True,
                             "message": (
-                                f"Binary opened: {view.file.filename}; background analysis started"
+                                f"Binary {'reused' if already_loaded else 'opened'}: "
+                                f"{view.file.filename}; "
+                                + (
+                                    "existing background analysis retained"
+                                    if already_loaded
+                                    else "background analysis started"
+                                )
                             ),
                             "filename": view.file.filename,
                             "view_id": view_id,
                             "view_selector": f"view:{view_id}",
-                            "analysis_mode": analysis_mode,
+                            "reused": already_loaded,
+                            "analysis_mode": effective_mode,
+                            "requested_analysis_mode": analysis_mode,
                             "platform": view.platform.name if view.platform else None,
                             "start": hex(view.start),
                             "end": hex(view.end),
                         }
                     )
+                except BinaryLoadConflict as exc:
+                    self._send_json_response({"error": str(exc)}, 409)
                 except Exception as e:
                     self._send_json_response({"error": str(e)}, 500)
+
+            elif path == "/syncInventory":
+                next_view_id = params.get("next_view_id")
+                if next_view_id is None:
+                    self._send_json_response(
+                        {"error": "Missing next_view_id parameter"},
+                        400,
+                    )
+                    return
+                try:
+                    self.binary_ops.reserve_next_view_id(next_view_id)
+                    self.binary_ops.persist_owned_view_inventory()
+                    self._send_json_response({"success": True})
+                except (TypeError, ValueError) as exc:
+                    self._send_json_response({"error": str(exc)}, 400)
+                except Exception as exc:
+                    self._send_json_response({"error": str(exc)}, 500)
+
+            elif path == "/close":
+                identifier = params.get("view") or params.get("binary")
+                if not identifier:
+                    self._send_json_response({"error": "Missing view parameter"}, 400)
+                    return
+                raw_discard = params.get("discard", False)
+                if isinstance(raw_discard, bool):
+                    discard = raw_discard
+                elif str(raw_discard).strip().lower() in {"1", "true", "yes"}:
+                    discard = True
+                elif str(raw_discard).strip().lower() in {"", "0", "false", "no"}:
+                    discard = False
+                else:
+                    self._send_json_response(
+                        {"error": "discard must be true or false"},
+                        400,
+                    )
+                    return
+                try:
+                    closed = self.binary_ops.close_owned_view(
+                        str(identifier),
+                        discard=discard,
+                    )
+                    self._send_json_response(
+                        {
+                            "success": True,
+                            "message": f"Binary closed: {closed['filepath']}",
+                            "closed": closed,
+                        }
+                    )
+                except KeyError as exc:
+                    self._send_json_response({"error": str(exc)}, 404)
+                except Exception as exc:
+                    self._send_json_response({"error": str(exc)}, 409)
 
             elif path == "/rename/function" or path == "/renameFunction":
                 old_name = params.get("oldName") or params.get("old_name")
@@ -2592,6 +2695,8 @@ class MCPServer:
         instance_id: str | None = None,
         auth_token: str | None = None,
         binary_loaded_callback: Callable[[dict[str, object], str | int], None] | None = None,
+        binary_inventory_callback: Callable[[list[dict[str, object]], int], None] | None = None,
+        rss_provider: Callable[[], int | None] | None = None,
     ):
         self.config = config
         self.server = None
@@ -2599,10 +2704,13 @@ class MCPServer:
         self.instance_id = instance_id or uuid.uuid4().hex
         self.auth_token = auth_token
         self.binary_loaded_callback = binary_loaded_callback
+        self.binary_inventory_callback = binary_inventory_callback
+        self.rss_provider = rss_provider
         self.operation_lock = threading.RLock()
         self.binary_ops = BinaryOperations(
             config.binary_ninja,
             state_lock=self.operation_lock,
+            owned_views_changed_callback=self.binary_inventory_callback,
         )
 
     def start(self) -> tuple[str, int]:
@@ -2624,6 +2732,11 @@ class MCPServer:
                 "binary_loaded_callback": (
                     staticmethod(self.binary_loaded_callback)
                     if self.binary_loaded_callback is not None
+                    else None
+                ),
+                "current_rss_provider": (
+                    staticmethod(getattr(self, "rss_provider", None))
+                    if getattr(self, "rss_provider", None) is not None
                     else None
                 ),
             },

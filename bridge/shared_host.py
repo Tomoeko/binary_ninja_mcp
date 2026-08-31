@@ -36,6 +36,18 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BN_PYTHON = Path("/Applications/Binary Ninja.app/Contents/Resources/python")
 REGISTRY_PROTOCOL = 1
 HEALTH_PROTOCOL = 1
+SESSION_PROTOCOL = 2
+MAX_SESSION_FILE_BYTES = 1024 * 1024
+VALID_ANALYSIS_MODES = frozenset(
+    {"basic", "controlFlowGraph", "full", "intermediate", "linearSweep"}
+)
+SOURCE_IDENTITY_FIELDS = (
+    "device",
+    "inode",
+    "size",
+    "mtime_ns",
+    "ctime_ns",
+)
 DEFAULT_IDLE_TIMEOUT_SEC = 60.0
 DEFAULT_RECOVERY_TIMEOUT_SEC = 30.0
 CONFIG_ENV = "BINJA_MCP_SHARED_HOST_CONFIG"
@@ -68,6 +80,36 @@ class SessionRestoreError(RuntimeError):
     """Recovery cannot preserve the prior stable view-id mapping."""
 
 
+class SessionSnapshot(NamedTuple):
+    binaries: list[dict[str, object]]
+    next_view_id: int
+
+
+def _stat_source_identity(filepath: str) -> dict[str, int]:
+    info = os.stat(filepath, follow_symlinks=True)
+    return {
+        "device": int(info.st_dev),
+        "inode": int(info.st_ino),
+        "size": int(info.st_size),
+        "mtime_ns": int(info.st_mtime_ns),
+        "ctime_ns": int(info.st_ctime_ns),
+    }
+
+
+def _normalize_source_identity(value: object, context: str) -> dict[str, int]:
+    if not isinstance(value, dict) or set(value) != set(SOURCE_IDENTITY_FIELDS):
+        raise SessionRestoreError(f"{context} has an invalid source identity")
+    normalized: dict[str, int] = {}
+    for field in SOURCE_IDENTITY_FIELDS:
+        component = value[field]
+        if not isinstance(component, int) or isinstance(component, bool):
+            raise SessionRestoreError(f"{context} has an invalid source identity")
+        if field in {"device", "inode", "size"} and component < 0:
+            raise SessionRestoreError(f"{context} has an invalid source identity")
+        normalized[field] = component
+    return normalized
+
+
 def _positive_number(value: object, name: str) -> float:
     try:
         parsed = float(value)
@@ -78,11 +120,23 @@ def _positive_number(value: object, name: str) -> float:
     return parsed
 
 
+def _positive_integer(value: object, name: str) -> int:
+    try:
+        parsed = int(str(value))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be a positive integer") from exc
+    if isinstance(value, bool) or parsed <= 0:
+        raise RuntimeError(f"{name} must be a positive integer")
+    return parsed
+
+
 def _source_fingerprint(
     host_python: str,
     bn_python_path: Path,
     bind_host: str,
     bind_port: int,
+    max_open_binaries: int = 2,
+    max_rss_mb: int = 16384,
 ) -> str:
     """Name hosts by runtime and all Python source loaded into the native host."""
     digest = hashlib.sha256()
@@ -92,6 +146,8 @@ def _source_fingerprint(
         str(bn_python_path.resolve()),
         bind_host,
         str(bind_port),
+        str(max_open_binaries),
+        str(max_rss_mb),
     ):
         digest.update(value.encode("utf-8"))
         digest.update(b"\0")
@@ -134,6 +190,8 @@ class SharedHostConfig:
     recovery_timeout: float
     fingerprint: str
     runtime_directory: Path
+    max_open_binaries: int = 2
+    max_rss_mb: int = 16384
     startup_binaries: tuple[str, ...] = ()
 
     @property
@@ -177,6 +235,8 @@ class SharedHostConfig:
                 "recovery_timeout": self.recovery_timeout,
                 "fingerprint": self.fingerprint,
                 "runtime_directory": str(self.runtime_directory),
+                "max_open_binaries": self.max_open_binaries,
+                "max_rss_mb": self.max_rss_mb,
                 "startup_binaries": list(self.startup_binaries),
             },
             separators=(",", ":"),
@@ -212,6 +272,14 @@ class SharedHostConfig:
             recovery_timeout=_positive_number(data["recovery_timeout"], "recovery timeout"),
             fingerprint=fingerprint,
             runtime_directory=Path(str(data["runtime_directory"])).absolute(),
+            max_open_binaries=_positive_integer(
+                data.get("max_open_binaries", 2),
+                "max open binaries",
+            ),
+            max_rss_mb=_positive_integer(
+                data.get("max_rss_mb", 16384),
+                "max RSS MiB",
+            ),
             startup_binaries=tuple(str(Path(item).expanduser().resolve()) for item in binaries),
         )
 
@@ -227,7 +295,22 @@ def build_shared_host_config(
 ) -> SharedHostConfig:
     if bind_port < 0 or bind_port > 65535:
         raise RuntimeError("headless HTTP port must be between 0 and 65535")
-    fingerprint = _source_fingerprint(host_python, bn_python_path, bind_host, bind_port)
+    max_open_binaries = _positive_integer(
+        os.environ.get("BINJA_MCP_MAX_OPEN_BINARIES", 2),
+        "BINJA_MCP_MAX_OPEN_BINARIES",
+    )
+    max_rss_mb = _positive_integer(
+        os.environ.get("BINJA_MCP_MAX_RSS_MB", 16384),
+        "BINJA_MCP_MAX_RSS_MB",
+    )
+    fingerprint = _source_fingerprint(
+        host_python,
+        bn_python_path,
+        bind_host,
+        bind_port,
+        max_open_binaries,
+        max_rss_mb,
+    )
     runtime_directory = _default_runtime_root() / fingerprint[:24]
     idle = _positive_number(
         os.environ.get("BINJA_MCP_SHARED_HOST_IDLE_SEC", DEFAULT_IDLE_TIMEOUT_SEC),
@@ -247,9 +330,9 @@ def build_shared_host_config(
         recovery_timeout=recovery,
         fingerprint=fingerprint,
         runtime_directory=runtime_directory,
-        startup_binaries=tuple(
-            str(Path(path).expanduser().resolve()) for path in startup_binaries
-        ),
+        max_open_binaries=max_open_binaries,
+        max_rss_mb=max_rss_mb,
+        startup_binaries=tuple(str(Path(path).expanduser().resolve()) for path in startup_binaries),
     )
 
 
@@ -564,9 +647,7 @@ def _atomic_json_write(path: Path, data: object) -> None:
         os.O_WRONLY | os.O_CREAT | os.O_EXCL,
     )
     try:
-        encoded = (json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n").encode(
-            "utf-8"
-        )
+        encoded = (json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
         offset = 0
         while offset < len(encoded):
             offset += os.write(descriptor, encoded[offset:])
@@ -775,28 +856,233 @@ def _tail(path: Path, limit: int = 5000) -> str:
         return ""
 
 
-def _read_session(config: SharedHostConfig) -> list[dict[str, object]]:
+def _read_session_snapshot(config: SharedHostConfig) -> SessionSnapshot:
     try:
-        data = json.loads(config.session_file.read_text(encoding="utf-8"))
+        encoded = config.session_file.read_bytes()
     except FileNotFoundError:
-        return []
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return SessionSnapshot([], 1)
+    except OSError as exc:
         raise SessionRestoreError(
             f"Cannot read Binary Ninja recovery manifest: {config.session_file}: {exc}"
         ) from exc
-    if not isinstance(data, list):
-        raise SessionRestoreError("Binary Ninja recovery manifest is not a list")
+    if len(encoded) > MAX_SESSION_FILE_BYTES:
+        raise SessionRestoreError(
+            "Binary Ninja recovery manifest exceeds the maximum permitted size"
+        )
+    try:
+        data = json.loads(encoded.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise SessionRestoreError(
+            f"Cannot parse Binary Ninja recovery manifest: {config.session_file}: {exc}"
+        ) from exc
+    if isinstance(data, list):
+        # Version 1 stored only the list. Derive a safe watermark while
+        # accepting manifests written by earlier releases.
+        raw_records = data
+        raw_next_view_id = None
+        legacy_manifest = True
+    elif isinstance(data, dict) and data.get("protocol") == SESSION_PROTOCOL:
+        raw_records = data.get("binaries")
+        raw_next_view_id = data.get("next_view_id")
+        legacy_manifest = False
+        if not isinstance(raw_records, list):
+            raise SessionRestoreError("Binary Ninja recovery manifest has an invalid binaries list")
+        if (
+            not isinstance(raw_next_view_id, int)
+            or isinstance(raw_next_view_id, bool)
+            or raw_next_view_id <= 0
+        ):
+            raise SessionRestoreError("Binary Ninja recovery manifest has an invalid next view id")
+    else:
+        raise SessionRestoreError("Binary Ninja recovery manifest has an invalid format")
+    if len(raw_records) > config.max_open_binaries:
+        raise SessionRestoreError(
+            "Binary Ninja recovery manifest exceeds the configured BinaryView limit"
+        )
     records: list[dict[str, object]] = []
-    for item in data:
+    seen_paths: set[str] = set()
+    seen_ids: set[int] = set()
+    seen_file_ids: set[tuple[int, int]] = set()
+    for item in raw_records:
         if not isinstance(item, dict) or not isinstance(item.get("filepath"), str):
             raise SessionRestoreError("Binary Ninja recovery manifest contains an invalid entry")
+        canonical = str(Path(str(item["filepath"])).expanduser().resolve())
+        analysis_mode = item.get("analysis_mode", "basic")
+        platform_name = item.get("platform", "")
+        image_base = item.get("image_base", "")
+        if analysis_mode not in VALID_ANALYSIS_MODES:
+            raise SessionRestoreError(
+                f"Binary Ninja recovery target has an invalid analysis mode: {canonical}"
+            )
+        if not isinstance(platform_name, str) or not isinstance(image_base, str):
+            raise SessionRestoreError(
+                f"Binary Ninja recovery target has invalid load settings: {canonical}"
+            )
+        if image_base:
+            try:
+                if int(image_base, 0) < 0:
+                    raise ValueError
+            except ValueError as exc:
+                raise SessionRestoreError(
+                    f"Binary Ninja recovery target has an invalid image base: {canonical}"
+                ) from exc
         view_id = item.get("view_id")
         if not isinstance(view_id, int) or isinstance(view_id, bool) or view_id <= 0:
             raise SessionRestoreError(
                 f"Binary Ninja recovery target has an invalid stable view id: {item.get('filepath')}"
             )
-        records.append(dict(item))
-    return sorted(records, key=lambda item: int(item["view_id"]))
+        if canonical in seen_paths or view_id in seen_ids:
+            raise SessionRestoreError(
+                "Binary Ninja recovery manifest contains duplicate paths or view ids"
+            )
+        source_identity_value = item.get("source_identity")
+        if legacy_manifest and source_identity_value is None:
+            try:
+                source_identity = _stat_source_identity(canonical)
+            except FileNotFoundError:
+                source_identity = None
+            except OSError as exc:
+                raise SessionRestoreError(
+                    f"Cannot inspect Binary Ninja recovery target: {canonical}: {exc}"
+                ) from exc
+        else:
+            source_identity = _normalize_source_identity(
+                source_identity_value,
+                f"Binary Ninja recovery target {canonical}",
+            )
+        seen_paths.add(canonical)
+        seen_ids.add(view_id)
+        if source_identity is not None:
+            file_id = (
+                source_identity["device"],
+                source_identity["inode"],
+            )
+            if file_id in seen_file_ids:
+                raise SessionRestoreError(
+                    "Binary Ninja recovery manifest contains duplicate file identities"
+                )
+            seen_file_ids.add(file_id)
+        record: dict[str, object] = {
+            "filepath": canonical,
+            "analysis_mode": analysis_mode,
+            "platform": platform_name,
+            "image_base": image_base,
+            "view_id": view_id,
+        }
+        if source_identity is not None:
+            record["source_identity"] = source_identity
+        records.append(record)
+    minimum_next = max(seen_ids, default=0) + 1
+    next_view_id = minimum_next if raw_next_view_id is None else raw_next_view_id
+    if next_view_id < minimum_next:
+        raise SessionRestoreError(
+            "Binary Ninja recovery manifest next view id precedes a live selector"
+        )
+    # Version 2 stores resident LRU-to-MRU order. Legacy lists had no such
+    # contract, so retain their historical stable-id ordering during upgrade.
+    ordered_records = (
+        sorted(records, key=lambda item: int(item["view_id"]))
+        if raw_next_view_id is None
+        else records
+    )
+    return SessionSnapshot(ordered_records, next_view_id)
+
+
+def _read_session(config: SharedHostConfig) -> list[dict[str, object]]:
+    """Compatibility helper returning only the resident binary records."""
+    return _read_session_snapshot(config).binaries
+
+
+def replace_binary_session(
+    config: SharedHostConfig,
+    records: list[dict[str, object]],
+    next_view_id: int,
+) -> None:
+    """Atomically replace the recovery manifest with the live owned-view set."""
+    if not isinstance(next_view_id, int) or isinstance(next_view_id, bool) or next_view_id <= 0:
+        raise SessionRestoreError("Cannot journal an invalid next BinaryView id")
+    if len(records) > config.max_open_binaries:
+        raise SessionRestoreError("Cannot journal more BinaryViews than the configured limit")
+    normalized: list[dict[str, object]] = []
+    seen_paths: set[str] = set()
+    seen_ids: set[int] = set()
+    seen_file_ids: set[tuple[int, int]] = set()
+    for payload in records:
+        filepath = payload.get("filepath")
+        view_id = payload.get("view_id")
+        if not isinstance(filepath, str) or not filepath:
+            raise SessionRestoreError("Cannot journal a BinaryView without a filepath")
+        if not isinstance(view_id, int) or isinstance(view_id, bool) or view_id <= 0:
+            raise SessionRestoreError(
+                f"Cannot journal Binary Ninja target with invalid view id {view_id!r}"
+            )
+        canonical = str(Path(filepath).expanduser().resolve())
+        analysis_mode = str(payload.get("analysis_mode") or "basic")
+        platform_name = str(payload.get("platform") or "")
+        image_base = str(payload.get("image_base") or "")
+        if analysis_mode not in VALID_ANALYSIS_MODES:
+            raise SessionRestoreError(f"Cannot journal invalid analysis mode {analysis_mode!r}")
+        if image_base:
+            try:
+                if int(image_base, 0) < 0:
+                    raise ValueError
+            except ValueError as exc:
+                raise SessionRestoreError(
+                    f"Cannot journal invalid image base {image_base!r}"
+                ) from exc
+        if canonical in seen_paths or view_id in seen_ids:
+            raise SessionRestoreError("Cannot journal duplicate Binary Ninja paths or view ids")
+        source_identity_value = payload.get("source_identity")
+        try:
+            current_source_identity = _stat_source_identity(canonical)
+        except FileNotFoundError as exc:
+            raise SessionRestoreError(
+                f"Cannot journal missing Binary Ninja target: {canonical}"
+            ) from exc
+        except OSError as exc:
+            raise SessionRestoreError(
+                f"Cannot inspect Binary Ninja target before journaling: {canonical}: {exc}"
+            ) from exc
+        source_identity = (
+            current_source_identity
+            if source_identity_value is None
+            else _normalize_source_identity(
+                source_identity_value,
+                f"Binary Ninja target {canonical}",
+            )
+        )
+        if source_identity != current_source_identity:
+            raise SessionRestoreError(
+                "Cannot journal a Binary Ninja target that changed on disk after "
+                f"its view was opened: {canonical}"
+            )
+        file_id = (source_identity["device"], source_identity["inode"])
+        if file_id in seen_file_ids:
+            raise SessionRestoreError("Cannot journal duplicate Binary Ninja file identities")
+        seen_paths.add(canonical)
+        seen_ids.add(view_id)
+        seen_file_ids.add(file_id)
+        normalized.append(
+            {
+                "filepath": canonical,
+                "analysis_mode": analysis_mode,
+                "platform": platform_name,
+                "image_base": image_base,
+                "view_id": view_id,
+                "source_identity": source_identity,
+            }
+        )
+    minimum_next = max(seen_ids, default=0) + 1
+    if next_view_id < minimum_next:
+        raise SessionRestoreError("Next BinaryView id precedes a live selector")
+    _atomic_json_write(
+        config.session_file,
+        {
+            "protocol": SESSION_PROTOCOL,
+            "next_view_id": next_view_id,
+            "binaries": normalized,
+        },
+    )
 
 
 def remember_binary(
@@ -826,14 +1112,19 @@ def remember_binary(
         )
     record["view_id"] = stable_view_id
     with exclusive_lock(config.session_lock_file):
-        records = _read_session(config)
+        snapshot = _read_session_snapshot(config)
+        records = snapshot.binaries
         for index, existing in enumerate(records):
             if existing.get("filepath") == canonical:
                 records[index] = record
                 break
         else:
             records.append(record)
-        _atomic_json_write(config.session_file, records)
+        replace_binary_session(
+            config,
+            records,
+            max(snapshot.next_view_id, stable_view_id + 1),
+        )
 
 
 def remember_binary_for_instance(
@@ -854,6 +1145,33 @@ def remember_binary_for_instance(
         # cleanup uses the same lock, so it either removes this completed write
         # or wins first and makes the instance check fail without recreation.
         remember_binary(config, payload, view_id)
+
+
+def replace_binary_session_for_instance(
+    config: SharedHostConfig,
+    instance_id: str,
+    records: list[dict[str, object]],
+    next_view_id: int,
+) -> None:
+    """Replace the manifest only while this host owns the client epoch."""
+    with exclusive_lock(config.lease_lock_file):
+        current = _read_host_record(config, require_ready=False)
+        if current is None or current.endpoint.instance_id != instance_id:
+            raise SessionRestoreError(
+                "Refusing to journal Binary Ninja views from a stopped or "
+                f"superseded host instance: {instance_id}"
+            )
+        with exclusive_lock(config.session_lock_file):
+            # Never let an emergency checkpoint or an in-flight suppressed
+            # restore move the stable-selector allocator backward. The disk
+            # watermark can be newer than this process's last callback while
+            # a recovery batch is still loading.
+            prior = _read_session_snapshot(config)
+            replace_binary_session(
+                config,
+                records,
+                max(next_view_id, prior.next_view_id),
+            )
 
 
 def _load_binary(record: HostRecord, payload: dict[str, object], timeout: float) -> dict:
@@ -897,6 +1215,52 @@ def _load_binary(record: HostRecord, payload: dict[str, object], timeout: float)
     return data
 
 
+def _sync_binary_inventory(
+    record: HostRecord,
+    timeout: float,
+    next_view_id: int,
+) -> None:
+    request = urllib.request.Request(
+        _host_url(record.endpoint, "syncInventory"),
+        data=json.dumps({"next_view_id": next_view_id}).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "X-Binary-Ninja-MCP-Token": record.auth_token,
+        },
+        method="POST",
+    )
+    try:
+        with DIRECT_HTTP_OPENER.open(request, timeout=timeout) as response:
+            data = json.load(response)
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.load(exc)
+        except Exception:
+            detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Binary Ninja inventory synchronization failed ({exc.code}): {detail}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            raise HostResponseTimedOut(
+                "Timed out while synchronizing Binary Ninja recovery state"
+            ) from exc
+        raise HostConnectionLost(f"Binary Ninja inventory synchronization failed: {exc}") from exc
+    except TimeoutError as exc:
+        raise HostResponseTimedOut(
+            "Timed out while synchronizing Binary Ninja recovery state"
+        ) from exc
+    except (
+        ConnectionError,
+        BrokenPipeError,
+        http.client.IncompleteRead,
+        http.client.RemoteDisconnected,
+    ) as exc:
+        raise HostConnectionLost(f"Binary Ninja inventory synchronization failed: {exc}") from exc
+    if not isinstance(data, dict) or not data.get("success"):
+        raise RuntimeError(f"Binary Ninja inventory synchronization failed: {data}")
+
+
 class SharedHostRuntime:
     """Resolve, lazily create, and recover the shared native host."""
 
@@ -911,8 +1275,8 @@ class SharedHostRuntime:
         config = SharedHostConfig.from_environment()
         return cls(config) if config is not None else None
 
-    def current_record(self) -> HostRecord | None:
-        return _read_host_record(self.config)
+    def current_record(self, *, require_ready: bool = True) -> HostRecord | None:
+        return _read_host_record(self.config, require_ready=require_ready)
 
     def remember_binary(self, payload: dict[str, object], view_id: str | int | None) -> None:
         remember_binary(self.config, payload, view_id)
@@ -924,6 +1288,19 @@ class SharedHostRuntime:
         view_id: str | int | None,
     ) -> None:
         remember_binary_for_instance(self.config, instance_id, payload, view_id)
+
+    def replace_binary_session_for_instance(
+        self,
+        instance_id: str,
+        records: list[dict[str, object]],
+        next_view_id: int,
+    ) -> None:
+        replace_binary_session_for_instance(
+            self.config,
+            instance_id,
+            records,
+            next_view_id,
+        )
 
     def ensure_host(self, *, previous_instance: str = "") -> HostRecord:
         with self._thread_lock:
@@ -1016,6 +1393,10 @@ class SharedHostRuntime:
             str(self.config.idle_timeout),
             "--claim-timeout",
             str(max(30.0, self.config.startup_timeout + 5.0)),
+            "--max-open-binaries",
+            str(self.config.max_open_binaries),
+            "--max-rss-mb",
+            str(self.config.max_rss_mb),
         ]
         log_descriptor = _open_private_file(
             self.config.log_file,
@@ -1077,15 +1458,51 @@ class SharedHostRuntime:
             os.environ.get("BINJA_MCP_HTTP_READ_TIMEOUT_SEC", 1740.0),
             "BINJA_MCP_HTTP_READ_TIMEOUT_SEC",
         )
-        for payload in _read_session(self.config):
-            filepath = str(payload.get("filepath") or "")
+        snapshot = _read_session_snapshot(self.config)
+        for stored_payload in snapshot.binaries:
+            filepath = str(stored_payload.get("filepath") or "")
             if not Path(filepath).is_file():
                 raise SessionRestoreError(
                     "Cannot restore Binary Ninja views without changing stable view ids: "
                     f"recorded target is missing: {filepath}"
                 )
+            expected_identity = _normalize_source_identity(
+                stored_payload.get("source_identity"),
+                f"Binary Ninja recovery target {filepath}",
+            )
+            try:
+                current_identity = _stat_source_identity(filepath)
+            except OSError as exc:
+                raise SessionRestoreError(
+                    f"Cannot inspect Binary Ninja recovery target: {filepath}: {exc}"
+                ) from exc
+            if current_identity != expected_identity:
+                raise SessionRestoreError(
+                    "Cannot restore Binary Ninja views without changing stable view ids: "
+                    f"recorded target changed on disk: {filepath}"
+                )
+        for stored_payload in snapshot.binaries:
+            payload = dict(stored_payload)
+            payload["next_view_id"] = snapshot.next_view_id
+            payload["suppress_inventory"] = True
+            filepath = str(payload.get("filepath") or "")
             try:
                 data = _load_binary(record, payload, timeout)
+                expected_identity = _normalize_source_identity(
+                    stored_payload.get("source_identity"),
+                    f"Binary Ninja recovery target {filepath}",
+                )
+                try:
+                    post_load_identity = _stat_source_identity(filepath)
+                except OSError as exc:
+                    raise SessionRestoreError(
+                        f"Cannot inspect restored Binary Ninja target: {filepath}: {exc}"
+                    ) from exc
+                if post_load_identity != expected_identity:
+                    raise SessionRestoreError(
+                        "Binary Ninja recovery target changed while it was being "
+                        f"opened: {filepath}"
+                    )
                 expected_view_id = payload.get("view_id")
                 if expected_view_id is not None and str(data.get("view_id")) != str(
                     expected_view_id
@@ -1095,13 +1512,20 @@ class SharedHostRuntime:
                         f"{filepath} expected view:{expected_view_id}, "
                         f"got view:{data.get('view_id')}"
                     )
-                remember_binary(self.config, payload, data.get("view_id"))
             except (HostConnectionLost, HostResponseTimedOut, SessionRestoreError):
                 raise
             except Exception as exc:
                 raise SessionRestoreError(
                     f"Cannot restore Binary Ninja target {filepath}: {exc}"
                 ) from exc
+        try:
+            _sync_binary_inventory(record, timeout, snapshot.next_view_id)
+        except (HostConnectionLost, HostResponseTimedOut):
+            raise
+        except Exception as exc:
+            raise SessionRestoreError(
+                f"Cannot synchronize restored Binary Ninja targets: {exc}"
+            ) from exc
 
     def _ensure_startup_binaries(self, record: HostRecord) -> HostRecord:
         if (
@@ -1121,12 +1545,11 @@ class SharedHostRuntime:
                 "image_base": "",
             }
             try:
-                data = _load_binary(record, payload, timeout)
+                _load_binary(record, payload, timeout)
             except HostConnectionLost:
                 record = self.recover_after_connection_loss(record.endpoint.instance_id)
                 if self._startup_loaded_generation == record.endpoint.instance_id:
                     return record
-                data = _load_binary(record, payload, timeout)
-            remember_binary(self.config, payload, data.get("view_id"))
+                _load_binary(record, payload, timeout)
         self._startup_loaded_generation = record.endpoint.instance_id
         return record

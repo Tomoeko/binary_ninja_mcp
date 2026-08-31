@@ -38,6 +38,225 @@ def make_record(instance: str = "instance-12345678", pid: int = 123) -> shared_h
 
 
 class SharedHostLifecycleTests(unittest.TestCase):
+    def test_versioned_manifest_prunes_views_but_preserves_id_watermark(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            shared_host.ensure_private_directory(config.runtime_directory.parent)
+            shared_host.ensure_private_directory(config.runtime_directory)
+            target = root / "target.bin"
+            target.write_bytes(b"target")
+
+            shared_host.replace_binary_session(
+                config,
+                [
+                    {
+                        "filepath": str(target),
+                        "analysis_mode": "basic",
+                        "platform": "",
+                        "image_base": "",
+                        "view_id": 5,
+                    }
+                ],
+                9,
+            )
+            snapshot = shared_host._read_session_snapshot(config)
+            self.assertEqual([record["view_id"] for record in snapshot.binaries], [5])
+            self.assertEqual(snapshot.next_view_id, 9)
+            identity = snapshot.binaries[0]["source_identity"]
+            info = target.stat()
+            self.assertEqual(
+                identity,
+                {
+                    "device": info.st_dev,
+                    "inode": info.st_ino,
+                    "size": info.st_size,
+                    "mtime_ns": info.st_mtime_ns,
+                    "ctime_ns": info.st_ctime_ns,
+                },
+            )
+
+            shared_host.replace_binary_session(config, [], 9)
+            empty = shared_host._read_session_snapshot(config)
+            self.assertEqual(empty.binaries, [])
+            self.assertEqual(empty.next_view_id, 9)
+
+    def test_instance_checkpoint_cannot_rewind_persisted_watermark(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_config(Path(directory))
+            shared_host.ensure_private_directory(config.runtime_directory.parent)
+            shared_host.ensure_private_directory(config.runtime_directory)
+            shared_host._write_host_record(config, make_record())
+            shared_host.replace_binary_session(config, [], 12)
+
+            shared_host.replace_binary_session_for_instance(
+                config,
+                make_record().endpoint.instance_id,
+                [],
+                1,
+            )
+
+            snapshot = shared_host._read_session_snapshot(config)
+            self.assertEqual(snapshot.binaries, [])
+            self.assertEqual(snapshot.next_view_id, 12)
+
+    def test_restore_defers_manifest_sync_until_the_complete_batch_succeeds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            shared_host.ensure_private_directory(config.runtime_directory.parent)
+            shared_host.ensure_private_directory(config.runtime_directory)
+            targets = [root / "one.bin", root / "two.bin"]
+            for target in targets:
+                target.write_bytes(target.name.encode("ascii"))
+            shared_host.replace_binary_session(
+                config,
+                [
+                    {"filepath": str(targets[0]), "view_id": 3},
+                    {"filepath": str(targets[1]), "view_id": 8},
+                ],
+                12,
+            )
+            original = config.session_file.read_bytes()
+            runtime = shared_host.SharedHostRuntime(config)
+
+            with (
+                mock.patch.object(
+                    shared_host,
+                    "_load_binary",
+                    side_effect=[
+                        {"view_id": 3},
+                        RuntimeError("second load failed"),
+                    ],
+                ) as load,
+                mock.patch.object(shared_host, "_sync_binary_inventory") as sync,
+                self.assertRaisesRegex(shared_host.SessionRestoreError, "second load failed"),
+            ):
+                runtime._restore_binaries(make_record())
+
+            self.assertEqual(config.session_file.read_bytes(), original)
+            self.assertEqual(load.call_count, 2)
+            for call in load.call_args_list:
+                self.assertTrue(call.args[1]["suppress_inventory"])
+                self.assertEqual(call.args[1]["next_view_id"], 12)
+            sync.assert_not_called()
+
+            with (
+                mock.patch.object(
+                    shared_host,
+                    "_load_binary",
+                    side_effect=[{"view_id": 3}, {"view_id": 8}],
+                ),
+                mock.patch.object(shared_host, "_sync_binary_inventory") as sync,
+            ):
+                runtime._restore_binaries(make_record())
+            sync.assert_called_once_with(make_record(), 1740.0, 12)
+
+    def test_empty_restore_still_reserves_and_syncs_the_id_watermark(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            shared_host.ensure_private_directory(config.runtime_directory.parent)
+            shared_host.ensure_private_directory(config.runtime_directory)
+            shared_host.replace_binary_session(config, [], 9)
+            runtime = shared_host.SharedHostRuntime(config)
+            record = make_record()
+
+            with (
+                mock.patch.object(shared_host, "_load_binary") as load,
+                mock.patch.object(shared_host, "_sync_binary_inventory") as sync,
+            ):
+                runtime._restore_binaries(record)
+
+            load.assert_not_called()
+            sync.assert_called_once_with(record, 1740.0, 9)
+
+    def test_inventory_sync_posts_the_id_watermark(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        with (
+            mock.patch.object(
+                shared_host.DIRECT_HTTP_OPENER,
+                "open",
+                return_value=response,
+            ) as open_request,
+            mock.patch.object(
+                shared_host.json,
+                "load",
+                return_value={"success": True},
+            ),
+        ):
+            shared_host._sync_binary_inventory(make_record(), 3.5, 17)
+
+        request = open_request.call_args.args[0]
+        self.assertEqual(json.loads(request.data), {"next_view_id": 17})
+        self.assertEqual(open_request.call_args.kwargs["timeout"], 3.5)
+
+    def test_restore_rejects_changed_identity_before_loading_any_view(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            shared_host.ensure_private_directory(config.runtime_directory.parent)
+            shared_host.ensure_private_directory(config.runtime_directory)
+            targets = [root / "one.bin", root / "two.bin"]
+            for target in targets:
+                target.write_bytes(target.name.encode("ascii"))
+            shared_host.replace_binary_session(
+                config,
+                [
+                    {"filepath": str(targets[0]), "view_id": 1},
+                    {"filepath": str(targets[1]), "view_id": 2},
+                ],
+                3,
+            )
+            targets[1].write_bytes(b"changed-after-journal")
+            runtime = shared_host.SharedHostRuntime(config)
+
+            with (
+                mock.patch.object(shared_host, "_load_binary") as load,
+                mock.patch.object(shared_host, "_sync_binary_inventory") as sync,
+                self.assertRaisesRegex(shared_host.SessionRestoreError, "changed on disk"),
+            ):
+                runtime._restore_binaries(make_record())
+
+            load.assert_not_called()
+            sync.assert_not_called()
+
+    def test_restore_rechecks_identity_after_each_load(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = make_config(root)
+            shared_host.ensure_private_directory(config.runtime_directory.parent)
+            shared_host.ensure_private_directory(config.runtime_directory)
+            target = root / "target.bin"
+            target.write_bytes(b"original")
+            shared_host.replace_binary_session(
+                config,
+                [{"filepath": str(target), "view_id": 4}],
+                5,
+            )
+            runtime = shared_host.SharedHostRuntime(config)
+
+            def mutate_during_load(*_args):
+                target.write_bytes(b"mutated-during-load")
+                return {"view_id": 4}
+
+            with (
+                mock.patch.object(
+                    shared_host,
+                    "_load_binary",
+                    side_effect=mutate_during_load,
+                ),
+                mock.patch.object(shared_host, "_sync_binary_inventory") as sync,
+                self.assertRaisesRegex(
+                    shared_host.SessionRestoreError,
+                    "changed while it was being opened",
+                ),
+            ):
+                runtime._restore_binaries(make_record())
+
+            sync.assert_not_called()
+
     def test_lease_is_non_inherited_and_scanner_tracks_its_lifetime(self):
         with tempfile.TemporaryDirectory() as directory:
             config = make_config(Path(directory))
@@ -197,7 +416,9 @@ class SharedHostLifecycleTests(unittest.TestCase):
 
             self.assertFalse(failures)
             self.assertEqual(spawn_count, 1)
-            self.assertEqual([item.endpoint.instance_id for item in results], [record.endpoint.instance_id] * 2)
+            self.assertEqual(
+                [item.endpoint.instance_id for item in results], [record.endpoint.instance_id] * 2
+            )
 
     def test_healthy_generation_survives_one_connection_reset(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -295,6 +516,35 @@ class SharedHostLifecycleTests(unittest.TestCase):
                 (root / "bridge" / "shared_host.py").write_text("changed", encoding="utf-8")
                 after = shared_host._source_fingerprint("python", root, "127.0.0.1", 0)
             self.assertNotEqual(before, after)
+
+    def test_cache_limit_changes_host_identity_and_round_trips_to_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "bridge").mkdir()
+            (root / "plugin").mkdir()
+            for name in ("binja_mcp_bridge.py", "headless_host.py", "shared_host.py"):
+                (root / "bridge" / name).write_text(name, encoding="utf-8")
+            (root / "plugin" / "host.py").write_text("plugin", encoding="utf-8")
+            with mock.patch.object(shared_host, "REPO_ROOT", root):
+                two = shared_host._source_fingerprint("python", root, "127.0.0.1", 0, 2)
+                three = shared_host._source_fingerprint("python", root, "127.0.0.1", 0, 3)
+            self.assertNotEqual(two, three)
+
+            rss_variant = shared_host._source_fingerprint("python", root, "127.0.0.1", 0, 3, 8192)
+            self.assertNotEqual(three, rss_variant)
+
+            config = replace(
+                make_config(root),
+                max_open_binaries=3,
+                max_rss_mb=8192,
+            )
+            environment = {}
+            config.to_environment(environment)
+            with mock.patch.dict(shared_host.os.environ, environment, clear=False):
+                decoded = shared_host.SharedHostConfig.from_environment()
+            self.assertIsNotNone(decoded)
+            self.assertEqual(decoded.max_open_binaries, 3)
+            self.assertEqual(decoded.max_rss_mb, 8192)
 
 
 if __name__ == "__main__":

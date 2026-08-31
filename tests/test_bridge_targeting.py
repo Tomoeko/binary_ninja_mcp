@@ -56,6 +56,7 @@ class BridgeTargetingTests(unittest.TestCase):
         analysis = manager.get_tool("decompile_function").parameters["properties"]
         self.assertIn("binary", analysis)
         for name in (
+            "close_binary",
             "convert_number",
             "list_binaries",
             "list_platforms",

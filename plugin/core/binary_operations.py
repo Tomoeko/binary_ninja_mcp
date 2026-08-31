@@ -5,6 +5,8 @@ import re
 import subprocess
 import threading
 import weakref
+from collections.abc import Callable
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +17,20 @@ from ..utils.string_utils import escape_non_ascii
 from .config import BinaryNinjaConfig
 
 
+class BinaryLoadConflict(RuntimeError):
+    """An existing path cannot satisfy a different immutable load request."""
+
+
+_STRING_SCAN_CHUNK_BYTES = 1024 * 1024
+
+
 class BinaryOperations:
-    def __init__(self, config: BinaryNinjaConfig, state_lock: Any | None = None):
+    def __init__(
+        self,
+        config: BinaryNinjaConfig,
+        state_lock: Any | None = None,
+        owned_views_changed_callback: Callable[[list[dict[str, object]], int], None] | None = None,
+    ):
         self.config = config
         # The HTTP server passes its operation lock here. UI callbacks and HTTP
         # requests then participate in the same critical section, so a view
@@ -30,8 +44,21 @@ class BinaryOperations:
         self._next_view_id: int = 1
         self._id_by_filename: dict[str, str] = {}
         # Views opened through /load have no GUI owner. Keep strong references
-        # to them until the headless host shuts down.
+        # in least-recently-used order, but bound the headless set so several
+        # MCP clients cannot retain an unlimited number of native analysis
+        # databases in one process.
         self._owned_views: dict[str, bn.BinaryView] = {}
+        self._owned_load_options: dict[str, dict[str, object]] = {}
+        self._owned_source_signatures: dict[str, tuple[int, int, int, int]] = {}
+        self._owned_recovery_identities: dict[str, tuple[int, int, int, int, int]] = {}
+        self._owned_views_changed_callback = owned_views_changed_callback
+        self._max_owned_views = getattr(config, "max_owned_views", None)
+        if self._max_owned_views is not None and (
+            isinstance(self._max_owned_views, bool)
+            or not isinstance(self._max_owned_views, int)
+            or self._max_owned_views <= 0
+        ):
+            raise ValueError("max_owned_views must be a positive integer or None")
         self._load_lock = threading.RLock()
 
     @property
@@ -51,10 +78,101 @@ class BinaryOperations:
                 # candidate. Assign only after registration so the newly
                 # selected GUI view cannot be cleared during its own setter.
                 self._current_view = bv
+                self._touch_owned_view(bv)
                 bn.log_info(f"Set current binary view: {bv.file.filename}")
             else:
                 self._current_view = None
                 bn.log_info("Cleared current binary view")
+
+    @staticmethod
+    def _canonical_path(filepath: str) -> str:
+        return os.path.realpath(os.path.expanduser(filepath))
+
+    @classmethod
+    def _owned_key(cls, filepath: str) -> str:
+        # normcase handles case-insensitive Windows aliases while realpath
+        # collapses relative paths and symlinks before ownership lookup.
+        return os.path.normcase(cls._canonical_path(filepath))
+
+    def _touch_owned_view(self, view: bn.BinaryView) -> None:
+        """Move an owned view to the MRU end without changing its selector."""
+        for key, candidate in list(self._owned_views.items()):
+            if candidate is view:
+                self._owned_views.pop(key)
+                self._owned_views[key] = candidate
+                return
+
+    def _find_owned_key(self, filepath: str) -> str | None:
+        """Resolve path aliases to the one resident file identity."""
+        canonical_path = self._canonical_path(filepath)
+        direct_key = self._owned_key(canonical_path)
+        if direct_key in self._owned_views:
+            return direct_key
+        # normcase does not fold aliases on case-insensitive macOS volumes and
+        # hard links can name the same file through unrelated real paths.
+        for key, options in self._owned_load_options.items():
+            resident_path = str(options["filepath"])
+            try:
+                if os.path.samefile(canonical_path, resident_path):
+                    return key
+            except (FileNotFoundError, OSError):
+                continue
+        return None
+
+    @staticmethod
+    def _source_signature(filepath: str) -> tuple[int, int, int, int]:
+        info = os.stat(filepath, follow_symlinks=True)
+        return (
+            int(info.st_dev),
+            int(info.st_ino),
+            int(info.st_size),
+            int(info.st_mtime_ns),
+        )
+
+    @staticmethod
+    def _recovery_source_identity(filepath: str) -> tuple[int, int, int, int, int]:
+        info = os.stat(filepath, follow_symlinks=True)
+        return (
+            int(info.st_dev),
+            int(info.st_ino),
+            int(info.st_size),
+            int(info.st_mtime_ns),
+            int(info.st_ctime_ns),
+        )
+
+    @staticmethod
+    def _source_identity_record(
+        identity: tuple[int, int, int, int, int],
+    ) -> dict[str, int]:
+        device, inode, size, mtime_ns, ctime_ns = identity
+        return {
+            "device": device,
+            "inode": inode,
+            "size": size,
+            "mtime_ns": mtime_ns,
+            "ctime_ns": ctime_ns,
+        }
+
+    def _refresh_owned_recovery_identity(
+        self,
+        key: str,
+    ) -> tuple[int, int, int, int, int]:
+        """Refresh ctime only after the live source signature still matches."""
+        filepath = str(self._owned_load_options[key]["filepath"])
+        identity = self._recovery_source_identity(filepath)
+        live_signature = identity[:4]
+        if self._owned_source_signatures[key] != live_signature:
+            raise BinaryLoadConflict(
+                f"{filepath} changed on disk after view:"
+                f"{self._view_id(self._owned_views[key])} was opened; close that "
+                "view before persisting recovery state"
+            )
+        # ctime can change when a hard-link alias is created without changing
+        # the bytes backing the resident view. The four-field live signature
+        # deliberately permits that case; the refreshed five-field identity
+        # is what a future process must match before restoring this view.
+        self._owned_recovery_identities[key] = identity
+        return identity
 
     @staticmethod
     def _sidecar_image_base(canonical_path: str) -> int | None:
@@ -86,6 +204,8 @@ class BinaryOperations:
         analysis_mode: str = "basic",
         platform_name: str | None = None,
         image_base: int | None = None,
+        preferred_view_id: str | int | None = None,
+        persist_inventory: bool = True,
     ) -> bn.BinaryView:
         """Open a binary promptly and schedule analysis in the background.
 
@@ -96,9 +216,12 @@ class BinaryOperations:
         ``/status`` while Binary Ninja analyzes the registered view.
         """
         try:
-            canonical_path = os.path.realpath(os.path.expanduser(filepath))
+            canonical_path = self._canonical_path(filepath)
             if not os.path.isfile(canonical_path):
                 raise FileNotFoundError(f"Binary does not exist: {canonical_path}")
+            owned_key = self._owned_key(canonical_path)
+            recovery_identity = self._recovery_source_identity(canonical_path)
+            source_signature = recovery_identity[:4]
 
             allowed_modes = {"basic", "controlFlowGraph", "full", "intermediate", "linearSweep"}
             if analysis_mode not in allowed_modes:
@@ -106,15 +229,68 @@ class BinaryOperations:
                     f"Unsupported analysis mode {analysis_mode!r}; expected one of "
                     f"{', '.join(sorted(allowed_modes))}"
                 )
+            if image_base is None:
+                image_base = self._sidecar_image_base(canonical_path)
+            requested_options: dict[str, object] = {
+                "filepath": canonical_path,
+                "analysis_mode": analysis_mode,
+                "platform": platform_name or "",
+                "image_base": "" if image_base is None else hex(image_base),
+            }
 
             with self._load_lock, self._state_lock:
-                existing = self._owned_views.get(canonical_path)
+                existing_key = self._find_owned_key(canonical_path)
+                existing = self._owned_views.get(existing_key) if existing_key is not None else None
                 if existing is not None:
+                    assert existing_key is not None
+                    if self._owned_source_signatures[existing_key] != source_signature:
+                        raise BinaryLoadConflict(
+                            f"{canonical_path} changed on disk after view:"
+                            f"{self._view_id(existing)} was opened; close that view "
+                            "before loading the replacement"
+                        )
+                    effective_options = self._owned_load_options[existing_key]
+                    option_names = ("analysis_mode", "platform", "image_base")
+                    conflicts = {
+                        name: {
+                            "resident": effective_options[name],
+                            "requested": requested_options[name],
+                        }
+                        for name in option_names
+                        if effective_options[name] != requested_options[name]
+                    }
+                    if conflicts:
+                        raise BinaryLoadConflict(
+                            f"{canonical_path} is already open with different immutable "
+                            f"load settings {conflicts}; close view:{self._view_id(existing)} "
+                            "before reopening it"
+                        )
+                    self._owned_recovery_identities[existing_key] = recovery_identity
+                    existing_id = self._view_id(existing)
+                    if preferred_view_id is not None and str(preferred_view_id) != existing_id:
+                        raise RuntimeError(
+                            "Binary Ninja recovery changed a stable view id: "
+                            f"expected view:{preferred_view_id}, got view:{existing_id}"
+                        )
                     self.current_view = existing
+                    if persist_inventory:
+                        self._notify_owned_views_changed()
+                    bn.log_info(
+                        f"Reusing managed BinaryView for {canonical_path} as view:{existing_id}"
+                    )
                     return existing
 
-                if image_base is None:
-                    image_base = self._sidecar_image_base(canonical_path)
+                while (
+                    self._max_owned_views is not None
+                    and len(self._owned_views) >= self._max_owned_views
+                ):
+                    self._evict_lru_owned_view()
+                    # Persist the eviction before allocating another native
+                    # analysis database. If the new load fails, recovery still
+                    # reflects the views that actually remain resident.
+                    if persist_inventory:
+                        self._notify_owned_views_changed()
+
                 options: dict[str, object] = {"analysis.mode": analysis_mode}
                 if platform_name:
                     options["loader.platform"] = platform_name
@@ -127,7 +303,7 @@ class BinaryOperations:
                         f"(mode={analysis_mode}, platform={platform_name or 'auto'}, "
                         f"base={hex(image_base) if image_base is not None else 'auto'})"
                     )
-                    self._current_view = bn.load(
+                    loaded_view = bn.load(
                         canonical_path,
                         update_analysis=False,
                         options=options,
@@ -137,36 +313,248 @@ class BinaryOperations:
                         "This Binary Ninja version lacks the nonblocking bn.load API"
                     )
 
-                if self._current_view is None:
+                if loaded_view is None:
                     raise RuntimeError(
                         f"Binary Ninja could not create a view for: {canonical_path}"
                     )
 
-                loaded_view = self._current_view
-                self._owned_views[canonical_path] = loaded_view
-                self._register_view(loaded_view)
-                # _register_view prunes stale GUI views; on the very first load its
-                # initial prune may clear current_view before registering this one.
-                self._current_view = loaded_view
-                loaded_view.update_analysis()
-                return loaded_view
+                try:
+                    post_load_identity = self._recovery_source_identity(canonical_path)
+                    if post_load_identity != recovery_identity:
+                        raise BinaryLoadConflict(
+                            f"{canonical_path} changed on disk while Binary Ninja "
+                            "was opening it; close the partial view and retry"
+                        )
+                    loaded_view.update_analysis()
+                    view_id = self._register_view(
+                        loaded_view,
+                        preferred_view_id=preferred_view_id,
+                    )
+                    self._owned_views[owned_key] = loaded_view
+                    self._owned_load_options[owned_key] = requested_options
+                    self._owned_source_signatures[owned_key] = source_signature
+                    self._owned_recovery_identities[owned_key] = post_load_identity
+                    # _register_view prunes stale GUI views; on the very first
+                    # load its initial prune may clear current_view before
+                    # registering this one.
+                    self._current_view = loaded_view
+                    if persist_inventory:
+                        self._notify_owned_views_changed()
+                    bn.log_info(
+                        f"Retaining {canonical_path} as view:{view_id} "
+                        f"({len(self._owned_views)}/{self._max_owned_views or 'unlimited'} "
+                        "managed views)"
+                    )
+                    return loaded_view
+                except Exception:
+                    # Never leave an untracked native analysis database alive
+                    # when registration, persistence, or scheduling fails.
+                    try:
+                        self._close_native_view(loaded_view)
+                    except Exception as close_error:
+                        bn.log_warn(f"Failed to close partially loaded BinaryView: {close_error}")
+                    self._owned_views.pop(owned_key, None)
+                    self._owned_load_options.pop(owned_key, None)
+                    self._owned_source_signatures.pop(owned_key, None)
+                    self._owned_recovery_identities.pop(owned_key, None)
+                    self._remove_view_registration(loaded_view)
+                    raise
         except Exception as e:
             bn.log_error(f"Failed to load binary: {e}")
             raise
 
-    def close_owned_views(self) -> None:
-        """Close BinaryViews opened by this service and release their owners."""
+    def owns_path(self, filepath: str) -> bool:
         with self._state_lock:
+            return self._find_owned_key(filepath) is not None
+
+    def owned_view_record(self, view: bn.BinaryView) -> dict[str, object] | None:
+        """Return the effective first-open settings for one managed view."""
+        with self._state_lock:
+            for key, candidate in self._owned_views.items():
+                if candidate is view:
+                    record = dict(self._owned_load_options[key])
+                    record["view_id"] = int(self._view_id(view))
+                    record["source_identity"] = self._source_identity_record(
+                        self._refresh_owned_recovery_identity(key)
+                    )
+                    return record
+        return None
+
+    def owned_view_records(self) -> list[dict[str, object]]:
+        with self._state_lock:
+            return self._owned_view_records()
+
+    def _owned_view_records(self) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        for key, view in self._owned_views.items():
+            record = dict(self._owned_load_options[key])
+            record["view_id"] = int(self._view_id(view))
+            record["source_identity"] = self._source_identity_record(
+                self._refresh_owned_recovery_identity(key)
+            )
+            records.append(record)
+        return records
+
+    def _notify_owned_views_changed(self) -> None:
+        callback = self._owned_views_changed_callback
+        if callback is not None:
+            callback(self._owned_view_records(), self._next_view_id)
+
+    def persist_owned_view_inventory(self) -> None:
+        with self._state_lock:
+            self._notify_owned_views_changed()
+
+    def reserve_next_view_id(self, next_view_id: str | int) -> None:
+        """Preserve the monotonic selector watermark across host recovery."""
+        try:
+            parsed = int(str(next_view_id))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid next BinaryView id: {next_view_id!r}") from exc
+        if parsed <= 0:
+            raise ValueError(f"Invalid next BinaryView id: {next_view_id!r}")
+        with self._state_lock:
+            self._next_view_id = max(self._next_view_id, parsed)
+
+    def _view_id(self, view: bn.BinaryView) -> str:
+        for view_id, reference in self._views_by_id.items():
+            if reference() is view:
+                return view_id
+        raise RuntimeError("Managed BinaryView has no stable view id")
+
+    @staticmethod
+    def _close_native_view(view: bn.BinaryView) -> None:
+        abort_analysis = getattr(view, "abort_analysis", None)
+        if callable(abort_analysis):
+            try:
+                abort_analysis()
+            except Exception as exc:
+                # FileMetadata.close is authoritative, but record why the
+                # cooperative analysis cancellation did not succeed.
+                bn.log_warn(f"Failed to abort BinaryView analysis before close: {exc}")
+        exit_view = getattr(view, "__exit__", None)
+        if callable(exit_view):
+            # BinaryView's public context protocol releases its native
+            # BinaryView reference before closing FileMetadata. Calling only
+            # file.close() leaves native view memory alive while Python still
+            # holds the wrapper in locals or callbacks.
+            exit_view(None, None, None)
+        else:
+            # Test doubles and older compatible APIs may expose only the
+            # documented FileMetadata close operation.
+            view.file.close()
+
+    @staticmethod
+    def _view_is_modified(view: bn.BinaryView) -> bool:
+        try:
+            file_metadata = view.file
+            return bool(file_metadata.modified) or bool(file_metadata.analysis_changed)
+        except Exception:
+            # Unknown state is treated as dirty to avoid silent data loss.
+            return True
+
+    def _remove_view_registration(self, view: bn.BinaryView) -> None:
+        for view_id, reference in list(self._views_by_id.items()):
+            try:
+                candidate = reference()
+            except Exception:
+                candidate = None
+            if candidate is view:
+                self._views_by_id.pop(view_id, None)
+        if self._current_view is view:
+            self._current_view = next(reversed(self._owned_views.values()), None)
+        self._prune_views()
+
+    def _evict_lru_owned_view(self) -> dict[str, object]:
+        owned_key = next(
+            (
+                key
+                for key, candidate in self._owned_views.items()
+                if not self._view_is_modified(candidate)
+            ),
+            None,
+        )
+        if owned_key is None:
+            dirty_paths = [
+                str(self._owned_load_options[key]["filepath"]) for key in self._owned_views
+            ]
+            raise RuntimeError(
+                "The headless BinaryView limit was reached, but every resident "
+                "view has unsaved changes. Close one explicitly with "
+                f"discard=true before opening another target: {dirty_paths}"
+            )
+        view = self._owned_views[owned_key]
+        record = dict(self._owned_load_options[owned_key])
+        record["view_id"] = int(self._view_id(view))
+        filepath = str(record["filepath"])
+        bn.log_warn(
+            f"Evicting least-recently-used BinaryView {filepath} before opening "
+            f"another target (limit={self._max_owned_views})"
+        )
+        # Close first. If Binary Ninja refuses to release the database, retain
+        # its owner and fail the incoming load instead of exceeding the cap.
+        self._close_native_view(view)
+        self._owned_views.pop(owned_key)
+        self._owned_load_options.pop(owned_key)
+        self._owned_source_signatures.pop(owned_key)
+        self._owned_recovery_identities.pop(owned_key)
+        self._remove_view_registration(view)
+        return record
+
+    def close_owned_view(
+        self,
+        identifier: str,
+        *,
+        discard: bool = False,
+    ) -> dict[str, object]:
+        """Close one service-owned view selected by its stable selector or path."""
+        with self._load_lock, self._state_lock:
+            selected = self._select_view(identifier)
+            if selected is None or self._current_view is None:
+                raise KeyError(f"BinaryView not found: {identifier}")
+            view = self._current_view
+            owned_key = next(
+                (key for key, candidate in self._owned_views.items() if candidate is view),
+                None,
+            )
+            if owned_key is None:
+                raise RuntimeError(
+                    "The selected BinaryView is owned by the Binary Ninja GUI and "
+                    "cannot be closed through MCP"
+                )
+            if self._view_is_modified(view) and not discard:
+                raise RuntimeError(
+                    "The selected BinaryView has unsaved changes; repeat with "
+                    "discard=true to close it intentionally"
+                )
+            record = dict(self._owned_load_options[owned_key])
+            record["view_id"] = int(self._view_id(view))
+            self._close_native_view(view)
+            self._owned_views.pop(owned_key)
+            self._owned_load_options.pop(owned_key)
+            self._owned_source_signatures.pop(owned_key)
+            self._owned_recovery_identities.pop(owned_key)
+            self._remove_view_registration(view)
+            self._notify_owned_views_changed()
+            return record
+
+    def close_owned_views(self, *, persist_inventory: bool = False) -> None:
+        """Close BinaryViews opened by this service and release their owners."""
+        with self._load_lock, self._state_lock:
             views = list(self._owned_views.values())
             self._owned_views.clear()
+            self._owned_load_options.clear()
+            self._owned_source_signatures.clear()
+            self._owned_recovery_identities.clear()
             self._current_view = None
             self._views_by_id.clear()
             self._id_by_filename.clear()
         for view in views:
             try:
-                view.file.close()
+                self._close_native_view(view)
             except Exception as e:
                 bn.log_warn(f"Failed to close BinaryView: {e}")
+        if persist_inventory:
+            self.persist_owned_view_inventory()
 
     # ---------------- Multi-binary helpers ----------------
     def _prune_views(self) -> None:
@@ -200,9 +588,23 @@ class BinaryOperations:
         except Exception:
             self._current_view = None
 
-    def _register_view(self, bv: bn.BinaryView) -> str:
+    def _register_view(
+        self,
+        bv: bn.BinaryView,
+        *,
+        preferred_view_id: str | int | None = None,
+    ) -> str:
         """Add a view to the managed list if not present, return its id."""
         self._prune_views()
+        preferred = None
+        if preferred_view_id is not None:
+            try:
+                preferred_number = int(str(preferred_view_id))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid preferred BinaryView id: {preferred_view_id!r}") from exc
+            if preferred_number <= 0:
+                raise ValueError(f"Invalid preferred BinaryView id: {preferred_view_id!r}")
+            preferred = str(preferred_number)
         # Reuse existing id if the exact object is already tracked
         for vid, w in list(self._views_by_id.items()):
             try:
@@ -210,6 +612,11 @@ class BinaryOperations:
             except Exception:
                 vb = None
             if vb is bv:
+                if preferred is not None and preferred != vid:
+                    raise RuntimeError(
+                        "Binary Ninja recovery changed a stable view id: "
+                        f"expected view:{preferred}, got view:{vid}"
+                    )
                 return vid
         # Prefer deduplication by canonical filename
         fn = None
@@ -221,12 +628,28 @@ class BinaryOperations:
             # If a view for this filename already exists, reuse its id and update the view
             existing_id = self._id_by_filename.get(fn)
             if existing_id and existing_id in self._views_by_id:
+                if preferred is not None and preferred != existing_id:
+                    raise RuntimeError(
+                        "Binary Ninja recovery changed a stable view id: "
+                        f"expected view:{preferred}, got view:{existing_id}"
+                    )
                 # Always store weak references so closed views can be pruned
                 self._views_by_id[existing_id] = weakref.ref(bv)
                 return existing_id
         # Assign a new id
-        vid = str(self._next_view_id)
-        self._next_view_id += 1
+        if preferred is not None:
+            collision = self._views_by_id.get(preferred)
+            if collision is not None and collision() is not bv:
+                raise RuntimeError(
+                    f"Binary Ninja recovery view id is already in use: view:{preferred}"
+                )
+            vid = preferred
+            self._next_view_id = max(self._next_view_id, int(preferred) + 1)
+        else:
+            while str(self._next_view_id) in self._views_by_id:
+                self._next_view_id += 1
+            vid = str(self._next_view_id)
+            self._next_view_id += 1
         self._views_by_id[vid] = weakref.ref(bv)
         if fn:
             self._id_by_filename[fn] = vid
@@ -376,6 +799,15 @@ class BinaryOperations:
             except Exception:
                 vb = None
         if vb is None:
+            # Resolve an alternate symlink/hard-link/case alias for a
+            # service-owned view before falling back to basename matching.
+            try:
+                owned_key = self._find_owned_key(s)
+                if owned_key is not None:
+                    vb = self._owned_views.get(owned_key)
+            except (OSError, ValueError):
+                vb = None
+        if vb is None:
             # Basenames are convenient but only deterministic when unique.
             basename_matches = []
             for _vid, w2 in self._views_by_id.items():
@@ -418,6 +850,14 @@ class BinaryOperations:
         """Return the number of live managed views under the shared state lock."""
         with self._state_lock:
             return len(self._list_open_binaries())
+
+    @property
+    def max_owned_views(self) -> int | None:
+        return self._max_owned_views
+
+    @property
+    def max_rss_mb(self) -> int | None:
+        return getattr(self.config, "max_rss_mb", None)
 
     def get_function_by_name_or_address(self, identifier: str | int) -> bn.Function | None:
         """Get a function by either its name or address.
@@ -1969,98 +2409,154 @@ class BinaryOperations:
             "source": source,
         }
 
-    def get_strings(self, offset: int = 0, limit: int = 100) -> list[dict[str, Any]]:
-        """Get list of strings in the current binary view with pagination.
+    def _string_scan_ranges(self, view: bn.BinaryView) -> list[tuple[int, int]]:
+        """Return sorted, disjoint mapped ranges for bounded string queries."""
+        ranges: list[tuple[int, int]] = []
+        try:
+            segments = view.segments
+        except Exception:
+            segments = ()
+        for segment in segments:
+            try:
+                start = int(segment.start)
+                end = int(segment.end)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if end > start:
+                ranges.append((start, end))
 
-        Returns a list of dictionaries containing:
-        - address: start address of the string (hex)
-        - length: length in bytes (int if available)
-        - type: Binary Ninja string type (str if available)
-        - value: best-effort decoded and escaped string value
-        """
-        if not self._current_view:
+        if not ranges:
+            try:
+                start = int(view.start)
+                end = int(view.end)
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "BinaryView does not expose a valid address range for string scanning"
+                ) from exc
+            if end > start:
+                ranges.append((start, end))
+
+        ranges.sort()
+        merged: list[tuple[int, int]] = []
+        for start, end in ranges:
+            if not merged or start > merged[-1][1]:
+                merged.append((start, end))
+                continue
+            previous_start, previous_end = merged[-1]
+            merged[-1] = (previous_start, max(previous_end, end))
+        return merged
+
+    def _string_references(self):
+        """Yield strings without asking Binary Ninja to materialize the whole view."""
+        view = self._current_view
+        if not view:
             raise RuntimeError("No binary loaded")
 
+        get_strings = getattr(view, "get_strings", None)
+        if not callable(get_strings):
+            raise RuntimeError(
+                "This Binary Ninja version lacks ranged BinaryView.get_strings support"
+            )
+
+        for range_start, range_end in self._string_scan_ranges(view):
+            chunk_start = range_start
+            while chunk_start < range_end:
+                chunk_end = min(range_end, chunk_start + _STRING_SCAN_CHUNK_BYTES)
+                try:
+                    references = get_strings(chunk_start, chunk_end - chunk_start)
+                except TypeError as exc:
+                    # Falling back to get_strings() or .strings would recreate
+                    # the unbounded allocation this path exists to prevent.
+                    raise RuntimeError(
+                        "This Binary Ninja version lacks ranged BinaryView.get_strings support"
+                    ) from exc
+                for string_reference in references:
+                    try:
+                        reference_start = int(string_reference.start)
+                    except (AttributeError, TypeError, ValueError):
+                        bn.log_debug("Ignoring string reference without a valid start address")
+                        continue
+                    # BNGetStringsInRange normally returns references whose start
+                    # lies inside the half-open range. Enforce that contract so
+                    # a boundary-spanning string cannot be emitted by two chunks.
+                    if chunk_start <= reference_start < chunk_end:
+                        yield string_reference
+                chunk_start = chunk_end
+
+    def _string_record(self, string_reference) -> dict[str, Any]:
+        addr = getattr(
+            string_reference,
+            "start",
+            getattr(string_reference, "address", None),
+        )
+        length = getattr(string_reference, "length", None)
+        string_type = getattr(string_reference, "type", None)
+        if string_type is not None:
+            string_type = str(string_type)
+        value = getattr(string_reference, "value", None)
+        if value is None and addr is not None and length is not None:
+            try:
+                raw = self._current_view.read(addr, length)
+                nul = raw.find(b"\x00")
+                if nul != -1:
+                    raw = raw[:nul]
+                value = raw.decode("utf-8", errors="ignore")
+            except Exception:
+                value = None
+        value = escape_non_ascii("" if value is None else str(value))
+        return {
+            "address": (
+                hex(addr) if isinstance(addr, int) else (str(addr) if addr is not None else None)
+            ),
+            "length": None if length is None else int(length),
+            "type": string_type,
+            "value": value,
+        }
+
+    def get_strings(self, offset: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+        """Return one string page without materializing records outside it."""
+        offset = max(0, int(offset))
+        limit = int(limit)
         results: list[dict[str, Any]] = []
-
+        if limit == 0:
+            return results
         try:
-            # Prefer modern API if available
-            strings_iter = None
-            if hasattr(self._current_view, "get_strings"):
+            stop = None if limit < 0 else offset + limit
+            for string_reference in islice(self._string_references(), offset, stop):
                 try:
-                    strings_iter = self._current_view.get_strings()
-                except TypeError:
-                    strings_iter = None
-
-            if strings_iter is None and hasattr(self._current_view, "strings"):
-                try:
-                    strings_iter = list(self._current_view.strings)
-                except Exception:
-                    strings_iter = []
-
-            if strings_iter is None:
-                strings_iter = []
-
-            for s in strings_iter:
-                try:
-                    addr = None
-                    length = None
-                    stype = None
-                    value = None
-
-                    # Common attributes on StringReference
-                    addr = getattr(s, "start", getattr(s, "address", None))
-                    length = getattr(s, "length", None)
-                    stype = getattr(s, "type", None)
-                    if stype is not None:
-                        try:
-                            stype = str(stype)
-                        except Exception:
-                            stype = str(stype)
-
-                    value = getattr(s, "value", None)
-
-                    # Best-effort read/decode if value is not present
-                    if value is None and addr is not None and length is not None:
-                        try:
-                            raw = self._current_view.read(addr, length)
-                            # Stop at first null byte if present
-                            nul = raw.find(b"\x00")
-                            if nul != -1:
-                                raw = raw[:nul]
-                            try:
-                                value = raw.decode("utf-8", errors="ignore")
-                            except Exception:
-                                value = raw.decode("latin-1", errors="ignore")
-                        except Exception:
-                            value = None
-
-                    # Ensure value is a string and escape non-ASCII
-                    if value is None:
-                        value = ""
-                    value = escape_non_ascii(str(value))
-
-                    results.append(
-                        {
-                            "address": hex(addr)
-                            if isinstance(addr, int)
-                            else (str(addr) if addr is not None else None),
-                            "length": int(length)
-                            if isinstance(length, (int,))
-                            else (None if length is None else int(length)),
-                            "type": stype,
-                            "value": value,
-                        }
-                    )
-                except Exception as e:
-                    # Keep collecting even if one entry fails
-                    bn.log_debug(f"Error processing string entry: {e}")
-                    continue
-
-            return results[offset : offset + limit]
-        except Exception as e:
-            bn.log_error(f"Error getting strings: {e}")
+                    results.append(self._string_record(string_reference))
+                except Exception as exc:
+                    bn.log_debug(f"Error processing string entry: {exc}")
+            return results
+        except Exception as exc:
+            bn.log_error(f"Error getting strings: {exc}")
             return []
+
+    def search_strings(
+        self,
+        pattern: str,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Filter strings in one pass while retaining only the requested page."""
+        offset = max(0, int(offset))
+        limit = int(limit)
+        lowered = str(pattern).lower()
+        page: list[dict[str, Any]] = []
+        total = 0
+        for string_reference in self._string_references():
+            try:
+                record = self._string_record(string_reference)
+            except Exception as exc:
+                bn.log_debug(f"Error processing string entry: {exc}")
+                continue
+            value = record.get("value")
+            if lowered and (not isinstance(value, str) or lowered not in value.lower()):
+                continue
+            if total >= offset and (limit < 0 or len(page) < limit):
+                page.append(record)
+            total += 1
+        return page, total
 
     def set_comment(self, address: int, comment: str) -> bool:
         """Set a comment at a specific address.

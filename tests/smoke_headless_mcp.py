@@ -22,6 +22,11 @@ def main() -> int:
         help="call the open_binary MCP tool for this path after startup",
     )
     parser.add_argument(
+        "--close-opened",
+        action="store_true",
+        help="close the --open-binary target and verify the original remains",
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=0,
@@ -116,6 +121,7 @@ def main() -> int:
     opened_status = ""
     scoped_statuses: dict[str, str] = {}
     open_elapsed = 0.0
+    close_result = ""
     if args.open_binary:
         open_path = Path(args.open_binary).resolve()
         started = time.monotonic()
@@ -148,6 +154,16 @@ def main() -> int:
                         "open_binary ignored sidecar image base: "
                         f"expected {expected_start}, got {parsed_status.get('start')}"
                     )
+        if args.close_opened:
+            close_result = call_tool("close_binary", {"view": str(open_path)})
+            if "Binary closed:" not in close_result:
+                raise RuntimeError(f"close_binary returned an unexpected result: {close_result}")
+            remaining = call_tool(
+                "get_binary_status",
+                {"binary": str(Path(args.binary).resolve())},
+            )
+            if json.loads(remaining).get("filename") != str(Path(args.binary).resolve()):
+                raise RuntimeError(f"close_binary removed the wrong view: {remaining}")
 
     regression_results: dict[str, str] = {}
     if args.regressions:
@@ -217,6 +233,8 @@ def main() -> int:
     tools = tools_response["result"]["tools"]
     if not any(tool["name"] == "open_binary" for tool in tools):
         raise RuntimeError("open_binary was not advertised by tools/list")
+    if not any(tool["name"] == "close_binary" for tool in tools):
+        raise RuntimeError("close_binary was not advertised by tools/list")
     decompile_schema = next(
         tool["inputSchema"] for tool in tools if tool["name"] == "decompile_function"
     )
@@ -235,6 +253,8 @@ def main() -> int:
         print(f"open_elapsed={open_elapsed:.3f}s")
         print(f"opened_status={opened_status}")
         print(f"scoped_targets={','.join(scoped_statuses)}")
+    if close_result:
+        print(f"close_result={close_result}")
     if regression_results:
         print(f"regressions={','.join(regression_results)}")
     return 0

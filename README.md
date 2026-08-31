@@ -206,6 +206,24 @@ count, platform, and mapped range. An adjacent JSON file with a `base` or
 `analysis_mode` can also be passed explicitly. Use `analysis_mode="full"` only
 when the additional analysis cost is intentional.
 
+Headless sessions retain at most two native analysis views by default. Exact
+path, symlink, and hard-link aliases reuse one view when their immutable load
+settings match; conflicting analysis mode, platform, image base, or a changed
+on-disk file is rejected instead of silently reusing the wrong analysis. The
+least-recently-used clean view is disposed before a third target opens, and the
+versioned recovery manifest is replaced atomically so an evicted target is not
+resurrected after a host restart. Set `BINJA_MCP_MAX_OPEN_BINARIES` to another
+positive integer when a deliberate comparison needs a different bound.
+
+The host also enforces a 16 GiB resident-memory ceiling. If native analysis
+crosses it, all managed views are aborted and disposed, the empty inventory is
+persisted, and the process is recycled so allocator high-water memory is
+actually returned to the operating system. Override the ceiling in MiB with
+`BINJA_MCP_MAX_RSS_MB`. The `close_binary` tool releases a selected view sooner;
+modified views require its explicit `discard=true` option. String pagination
+and filtering retain only the requested result page rather than constructing a
+Python dictionary for every discovered string on every request.
+
 A startup target can instead be supplied by appending `--binary`, followed by
 its path, to `args`. The launcher supervises both children and tears down the
 bridge if the Binary Ninja HTTP host exits, preventing a stale MCP process that

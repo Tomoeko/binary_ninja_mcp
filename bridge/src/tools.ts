@@ -11,6 +11,7 @@ import { z } from "zod";
 import { BinjaHttpClient, withBinaryTarget } from "./client.js";
 
 const UNSCOPED_TOOL_NAMES = new Set([
+  "close_binary",
   "open_binary",
   "list_binaries",
   "select_binary",
@@ -920,6 +921,19 @@ export function registerTools(server: McpServer, client: BinjaHttpClient): void 
         platform,
         image_base,
       });
+      return { content: [{ type: "text", text: result }] };
+    }
+  );
+
+  tool(
+    "close_binary",
+    "Release one headless BinaryView and its native analysis memory.",
+    {
+      view: z.string().describe("Stable view:N selector or absolute path"),
+      discard: z.boolean().default(false).describe("Allow closing a modified view"),
+    },
+    async ({ view, discard }) => {
+      const result = await client.post("close", { view, discard });
       return { content: [{ type: "text", text: result }] };
     }
   );

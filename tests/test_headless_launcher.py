@@ -42,6 +42,52 @@ class FakeBinaryNinja:
 
 
 class HeadlessHostTests(unittest.TestCase):
+    def test_memory_limit_closes_inventory_and_requests_host_recycle(self):
+        class Stopping:
+            requested = False
+
+            def wait(self, _timeout):
+                return False
+
+            def set(self):
+                self.requested = True
+
+        stopping = Stopping()
+        binary_ops = mock.Mock()
+        server = mock.Mock(
+            operation_lock=threading.RLock(),
+            binary_ops=binary_ops,
+        )
+        checkpoint = mock.Mock()
+        with mock.patch.object(headless_host, "current_rss_bytes", return_value=101):
+            headless_host.monitor_memory_limit(stopping, server, 100, checkpoint)
+
+        self.assertTrue(stopping.requested)
+        checkpoint.assert_called_once_with()
+        binary_ops.close_owned_views.assert_called_once_with(persist_inventory=False)
+
+    def test_memory_limit_checkpoints_before_waiting_for_native_lock(self):
+        stopping = threading.Event()
+        native_lock = threading.Lock()
+        native_lock.acquire()
+        checkpointed = threading.Event()
+        server = mock.Mock(operation_lock=native_lock, binary_ops=mock.Mock())
+
+        with mock.patch.object(headless_host, "current_rss_bytes", return_value=101):
+            monitor = threading.Thread(
+                target=headless_host.monitor_memory_limit,
+                args=(stopping, server, 100, checkpointed.set),
+            )
+            monitor.start()
+            self.assertTrue(checkpointed.wait(2))
+            self.assertTrue(stopping.wait(2))
+            server.binary_ops.close_owned_views.assert_not_called()
+            native_lock.release()
+            monitor.join(2)
+
+        self.assertFalse(monitor.is_alive())
+        server.binary_ops.close_owned_views.assert_called_once_with(persist_inventory=False)
+
     def test_runtime_requires_native_analysis_plugins(self):
         bn = FakeBinaryNinja([], [], ["Raw", "Mapped"])
         with self.assertRaisesRegex(RuntimeError, "native analysis plugins"):
@@ -293,7 +339,7 @@ class LauncherTests(unittest.TestCase):
                     "--bridge-python",
                     "/bridge/python",
                 ]
-        )
+            )
         self.assertEqual(result, 0)
         build_config.assert_called_once()
         config.to_environment.assert_called_once()
