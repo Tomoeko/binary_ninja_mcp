@@ -9,6 +9,7 @@ import threading
 import types
 import unittest
 from pathlib import Path
+from typing import ClassVar
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -848,11 +849,73 @@ class LoadJournalTests(unittest.TestCase):
         try:
             handler_class = server.server.RequestHandlerClass
             handler = handler_class.__new__(handler_class)
+            second_handler = handler_class.__new__(handler_class)
+            self.assertIs(handler.native_mcp, second_handler.native_mcp)
+            self.assertIs(handler.native_mcp, server.native_mcp)
             handler.binary_loaded_callback({"filepath": "/target.bin"}, "7")
         finally:
             server.stop()
 
         self.assertEqual(events, [({"filepath": "/target.bin"}, "7")])
+
+
+class NativeMcpProjectLifecycleTests(unittest.TestCase):
+    def test_bnpm_project_handle_survives_across_request_handlers(self):
+        class FakeProject:
+            def __init__(self, path):
+                self.path = path
+                self.name = "fixture"
+                self.is_open = True
+                self.files = []
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                return True
+
+        class FakeProjectType:
+            opened: ClassVar[list[FakeProject]] = []
+
+            @classmethod
+            def open_project(cls, path):
+                project = FakeProject(path)
+                cls.opened.append(project)
+                return project
+
+        operations = types.SimpleNamespace(
+            current_view=None,
+            list_open_binaries=lambda: [],
+        )
+        dispatcher = server_module.NativeMcpCompat(operations)
+        handler_class = type(
+            "PersistentNativeHandler",
+            (server_module.MCPRequestHandler,),
+            {
+                "binary_ops": operations,
+                "_native_mcp_dispatcher": dispatcher,
+            },
+        )
+        first = handler_class.__new__(handler_class)
+        second = handler_class.__new__(handler_class)
+
+        with tempfile.TemporaryDirectory() as directory:
+            metadata = Path(directory) / "fixture.bnpm"
+            metadata.write_text("project", encoding="utf-8")
+            with mock.patch.object(server_module.bn, "Project", FakeProjectType):
+                opened = first.native_mcp.dispatch(
+                    "bn_open_item_open",
+                    {"path": str(metadata), "kind": "auto"},
+                )
+                handle = opened["openItem"]["handle"]
+                listed = second.native_mcp.dispatch("bn_project_file_list", {"project": handle})
+                closed = second.native_mcp.dispatch(
+                    "bn_open_item_close",
+                    {"openItem": handle, "save": "discard"},
+                )
+
+        self.assertEqual(listed["projectFiles"], [])
+        self.assertTrue(closed["closed"])
+        self.assertTrue(FakeProjectType.opened[0].closed)
 
 
 if __name__ == "__main__":

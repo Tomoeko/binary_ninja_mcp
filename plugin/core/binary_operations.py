@@ -508,10 +508,10 @@ class BinaryOperations:
     ) -> dict[str, object]:
         """Close one service-owned view selected by its stable selector or path."""
         with self._load_lock, self._state_lock:
-            selected = self._select_view(identifier)
-            if selected is None or self._current_view is None:
+            resolved = self._lookup_view(identifier)
+            if resolved is None:
                 raise KeyError(f"BinaryView not found: {identifier}")
-            view = self._current_view
+            _selected, view = resolved
             owned_key = next(
                 (key for key, candidate in self._owned_views.items() if candidate is view),
                 None,
@@ -635,6 +635,17 @@ class BinaryOperations:
                     )
                 # Always store weak references so closed views can be pruned
                 self._views_by_id[existing_id] = weakref.ref(bv)
+                # Native Binary Ninja 6 view switching can replace the active
+                # analyzed view (for example Mach-O with Raw) while retaining
+                # the same open file. Keep the service-owned strong reference
+                # aligned with the selected view so the registration remains
+                # alive after a later target switch.
+                try:
+                    owned_key = self._find_owned_key(fn)
+                except (OSError, ValueError):
+                    owned_key = None
+                if owned_key is not None and owned_key in self._owned_views:
+                    self._owned_views[owned_key] = bv
                 return existing_id
         # Assign a new id
         if preferred is not None:
@@ -754,7 +765,20 @@ class BinaryOperations:
         with self._state_lock:
             return self._select_view(ident)
 
+    def lookup_view(self, ident: str) -> tuple[dict[str, str], bn.BinaryView] | None:
+        """Resolve a managed view without changing the active selection."""
+        with self._state_lock:
+            return self._lookup_view(ident)
+
     def _select_view(self, ident: str) -> dict[str, str] | None:
+        resolved = self._lookup_view(ident)
+        if resolved is None:
+            return None
+        record, view = resolved
+        self.current_view = view
+        return record
+
+    def _lookup_view(self, ident: str) -> tuple[dict[str, str], bn.BinaryView] | None:
         s = (ident or "").strip()
         if not s:
             return None
@@ -834,7 +858,6 @@ class BinaryOperations:
                 vb = basename_matches[0]
         if vb is None:
             return None
-        self.current_view = vb
         vid = None
         for k, wv in self._views_by_id.items():
             try:
@@ -844,7 +867,10 @@ class BinaryOperations:
             if vv is vb:
                 vid = k
                 break
-        return {"id": vid or "", "filename": getattr(vb.file, "filename", "(unknown)")}
+        return (
+            {"id": vid or "", "filename": getattr(vb.file, "filename", "(unknown)")},
+            vb,
+        )
 
     def managed_view_count(self) -> int:
         """Return the number of live managed views under the shared state lock."""

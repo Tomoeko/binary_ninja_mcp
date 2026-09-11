@@ -50,6 +50,7 @@ SOURCE_IDENTITY_FIELDS = (
 )
 DEFAULT_IDLE_TIMEOUT_SEC = 60.0
 DEFAULT_RECOVERY_TIMEOUT_SEC = 30.0
+DEFAULT_MAX_OPEN_BINARIES = 8
 CONFIG_ENV = "BINJA_MCP_SHARED_HOST_CONFIG"
 DIRECT_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -135,7 +136,7 @@ def _source_fingerprint(
     bn_python_path: Path,
     bind_host: str,
     bind_port: int,
-    max_open_binaries: int = 2,
+    max_open_binaries: int = DEFAULT_MAX_OPEN_BINARIES,
     max_rss_mb: int = 16384,
 ) -> str:
     """Name hosts by runtime and all Python source loaded into the native host."""
@@ -190,7 +191,7 @@ class SharedHostConfig:
     recovery_timeout: float
     fingerprint: str
     runtime_directory: Path
-    max_open_binaries: int = 2
+    max_open_binaries: int = DEFAULT_MAX_OPEN_BINARIES
     max_rss_mb: int = 16384
     startup_binaries: tuple[str, ...] = ()
 
@@ -273,7 +274,7 @@ class SharedHostConfig:
             fingerprint=fingerprint,
             runtime_directory=Path(str(data["runtime_directory"])).absolute(),
             max_open_binaries=_positive_integer(
-                data.get("max_open_binaries", 2),
+                data.get("max_open_binaries", DEFAULT_MAX_OPEN_BINARIES),
                 "max open binaries",
             ),
             max_rss_mb=_positive_integer(
@@ -296,7 +297,7 @@ def build_shared_host_config(
     if bind_port < 0 or bind_port > 65535:
         raise RuntimeError("headless HTTP port must be between 0 and 65535")
     max_open_binaries = _positive_integer(
-        os.environ.get("BINJA_MCP_MAX_OPEN_BINARIES", 2),
+        os.environ.get("BINJA_MCP_MAX_OPEN_BINARIES", DEFAULT_MAX_OPEN_BINARIES),
         "BINJA_MCP_MAX_OPEN_BINARIES",
     )
     max_rss_mb = _positive_integer(

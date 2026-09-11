@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import sys
 import threading
@@ -15,7 +16,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from shared_host import SharedHostRuntime, monitor_shared_host_lifetime  # noqa: E402
+from shared_host import (  # noqa: E402
+    DEFAULT_MAX_OPEN_BINARIES,
+    SharedHostRuntime,
+    monitor_shared_host_lifetime,
+)
 
 
 def positive_integer(value: str) -> int:
@@ -223,10 +228,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-open-binaries",
         type=positive_integer,
-        default=os.environ.get("BINJA_MCP_MAX_OPEN_BINARIES", "2"),
+        default=os.environ.get(
+            "BINJA_MCP_MAX_OPEN_BINARIES",
+            str(DEFAULT_MAX_OPEN_BINARIES),
+        ),
         help=(
             "maximum headless BinaryViews retained at once "
-            "(default: 2; override with BINJA_MCP_MAX_OPEN_BINARIES)"
+            f"(default: {DEFAULT_MAX_OPEN_BINARIES}; override with "
+            "BINJA_MCP_MAX_OPEN_BINARIES)"
         ),
     )
     parser.add_argument(
@@ -279,6 +288,15 @@ def stop_on_stdin_eof(
 def validate_runtime(bn) -> tuple[list[str], list[str], list[str]]:
     """Initialize native plugins and reject a raw-only analysis runtime."""
     bn._init_plugins()
+    version_provider = getattr(bn, "core_version", None)
+    if callable(version_provider):
+        version = str(version_provider())
+        match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
+        if match and tuple(map(int, match.groups())) < (6, 0, 10601):
+            raise RuntimeError(
+                "Binary Ninja 6 native MCP compatibility requires build 6.0.10601 "
+                f"or newer; found {version}"
+            )
     architectures = [architecture.name for architecture in bn.Architecture]
     platforms = [platform.name for platform in bn.Platform]
     view_types = [view_type.name for view_type in bn.BinaryViewType]
@@ -334,7 +352,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         "Binary Ninja headless runtime ready: "
-        f"{len(architectures)} architectures, {len(platforms)} platforms, "
+        f"{bn.core_version()}; {len(architectures)} architectures, {len(platforms)} platforms, "
         f"{len(view_types)} view types",
         file=sys.stderr,
         flush=True,

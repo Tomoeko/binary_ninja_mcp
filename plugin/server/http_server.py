@@ -16,6 +16,14 @@ from binaryninja.enums import AnalysisState
 from binaryninja.settings import Settings
 
 from ..api.endpoints import BinaryNinjaEndpoints
+from ..api.native_mcp import (
+    NATIVE_TARGET_FREE_TOOLS,
+    NATIVE_V6_BACKEND_TOOL_NAMES,
+    NATIVE_V6_COMPAT_BUILD,
+    NATIVE_V6_TOOL_COUNT,
+    NativeMcpCompat,
+    NativeMcpError,
+)
 from ..core.binary_operations import BinaryLoadConflict, BinaryOperations
 from ..core.config import Config
 from ..utils.number_utils import convert_number as util_convert_number
@@ -39,6 +47,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
     auth_token = None
     binary_loaded_callback = None
     current_rss_provider = None
+    _native_mcp_dispatcher = None
     _target_free_paths = frozenset(
         {
             "/binaries",
@@ -63,6 +72,17 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 raise RuntimeError("binary_ops not initialized")
             self._endpoints = BinaryNinjaEndpoints(self.binary_ops)
         return self._endpoints
+
+    @property
+    def native_mcp(self):
+        """Return the server-owned Binary Ninja 6 compatibility dispatcher."""
+        dispatcher = self._native_mcp_dispatcher
+        if dispatcher is None:
+            if not self.binary_ops:
+                raise RuntimeError("binary_ops not initialized")
+            dispatcher = NativeMcpCompat(self.binary_ops)
+            type(self)._native_mcp_dispatcher = dispatcher
+        return dispatcher
 
     def log_message(self, format, *args):
         bn.log_info(format % args)
@@ -331,7 +351,22 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             # Retain compatibility with older GUI/bridge clients. New bridges
             # use the encoded header so Unicode filenames are always valid.
             target = self.headers.get("X-Binary-Ninja-View", "").strip()
-        if target and (not self.binary_ops or not self.binary_ops.select_view(target)):
+        selected_target = True
+        target_error: NativeMcpError | None = None
+        if target:
+            if not self.binary_ops:
+                selected_target = False
+            else:
+                try:
+                    selected_target = (
+                        self.native_mcp.select_target(target)
+                        if target.startswith("candidate:view:")
+                        else self.binary_ops.select_view(target) is not None
+                    )
+                except NativeMcpError as exc:
+                    target_error = exc
+                    selected_target = False
+        if target and not selected_target:
             available = []
             if self.binary_ops:
                 available = (
@@ -339,7 +374,11 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 )
             self._send_json_response(
                 {
-                    "error": f"Binary not found: {target}",
+                    "error": (
+                        target_error.to_dict()
+                        if target_error is not None
+                        else f"Binary not found: {target}"
+                    ),
                     "available": available,
                 },
                 404,
@@ -379,6 +418,9 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
     @classmethod
     def _requires_explicit_target(cls, path: str) -> bool:
         """Return whether a multi-view request must name its BinaryView."""
+        if path.startswith("/native/"):
+            tool = path.removeprefix("/native/")
+            return tool not in NATIVE_TARGET_FREE_TOOLS
         return path not in cls._target_free_paths
 
     def do_GET(self):
@@ -434,6 +476,10 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 status = {
                     "instance_id": self.instance_id,
                     "pid": os.getpid(),
+                    "binary_ninja_version": bn.core_version(),
+                    "native_mcp_compat_build": NATIVE_V6_COMPAT_BUILD,
+                    "native_mcp_tool_count": NATIVE_V6_TOOL_COUNT,
+                    "native_mcp_tools": sorted(NATIVE_V6_BACKEND_TOOL_NAMES),
                     "loaded": view is not None,
                     "filename": view.file.filename if view else None,
                     "managed_view_count": (
@@ -2114,10 +2160,12 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             if not self._prepare_request():
                 return
             path = urllib.parse.urlparse(self.path).path
+            native_tool = path.removeprefix("/native/") if path.startswith("/native/") else None
             # Lifecycle endpoints must remain available before a BinaryView
             # exists so clients can bootstrap or recover deterministically.
             if (
                 path not in {"/load", "/close", "/syncInventory"}
+                and native_tool not in NATIVE_TARGET_FREE_TOOLS
                 and not self._check_binary_loaded()
             ):
                 return
@@ -2126,7 +2174,24 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
             bn.log_info(f"POST {path} with params: {params}")
 
-            if path == "/load":
+            if native_tool:
+                try:
+                    self._send_json_response(self.native_mcp.dispatch(native_tool, params))
+                except NativeMcpError as exc:
+                    not_found = exc.code.endswith("_not_found") or exc.code in {
+                        "binary_view_not_found",
+                        "item_not_found",
+                        "project_file_not_found",
+                        "type_not_found",
+                    }
+                    self._send_json_response(
+                        {"error": exc.to_dict()},
+                        404 if not_found else 400,
+                    )
+                except (TypeError, ValueError) as exc:
+                    self._send_json_response({"error": str(exc)}, 400)
+
+            elif path == "/load":
                 filepath = params.get("filepath")
                 if not filepath:
                     self._send_json_response({"error": "Missing filepath parameter"}, 400)
@@ -2712,10 +2777,15 @@ class MCPServer:
             state_lock=self.operation_lock,
             owned_views_changed_callback=self.binary_inventory_callback,
         )
+        self.native_mcp = NativeMcpCompat(self.binary_ops)
 
     def start(self) -> tuple[str, int]:
         """Start the HTTP server in a background thread."""
         server_address = (self.config.server.host, self.config.server.port)
+        native_dispatcher = getattr(self, "native_mcp", None)
+        if native_dispatcher is None:
+            native_dispatcher = NativeMcpCompat(self.binary_ops)
+            self.native_mcp = native_dispatcher
 
         # Create handler with access to binary operations
         handler_class = type(
@@ -2726,6 +2796,7 @@ class MCPServer:
                 "operation_lock": self.operation_lock,
                 "instance_id": self.instance_id,
                 "auth_token": self.auth_token,
+                "_native_mcp_dispatcher": native_dispatcher,
                 # Plain functions stored on a class are descriptors. Without
                 # staticmethod, accessing this through a request handler binds
                 # the handler as an unexpected third callback argument.

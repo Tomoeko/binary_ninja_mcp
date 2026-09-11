@@ -56,6 +56,14 @@ class _MutationOutcomeUnknown(RuntimeError):
     """The connection died after a mutation may have reached the old host."""
 
 
+class _NativeSessionReset(RuntimeError):
+    """The native session's host generation changed and ephemeral state was lost."""
+
+    def __init__(self, instance_id: str):
+        super().__init__("Binary Ninja native MCP session reset")
+        self.instance_id = instance_id
+
+
 def _endpoint(previous_instance: str = "") -> _HttpEndpoint:
     if _shared_host_runtime is None:
         return _HttpEndpoint(binja_server_url, _binja_auth_token, "")
@@ -191,6 +199,8 @@ def _request(
     endpoint: str,
     *,
     retry_safe: bool,
+    expected_instance: str = "",
+    replay_after_recovery: bool = True,
     **kwargs,
 ):
     """Send through the current host and recover only on connection loss.
@@ -202,6 +212,8 @@ def _request(
     mutations return an explicit unknown-outcome error instead.
     """
     current = _endpoint()
+    if expected_instance and current.instance_id and current.instance_id != expected_instance:
+        raise _NativeSessionReset(current.instance_id)
 
     def send(target: _HttpEndpoint):
         request_kwargs = dict(kwargs)
@@ -234,6 +246,8 @@ def _request(
             _shared_host_runtime.recover_after_connection_loss(current.instance_id)
         )
         if retry_safe:
+            if not replay_after_recovery and replacement.instance_id != current.instance_id:
+                raise _NativeSessionReset(replacement.instance_id) from exc
             return send(replacement)
         raise _MutationOutcomeUnknown(
             "Binary Ninja host connection was lost after the request may have been "
@@ -502,6 +516,109 @@ def safe_delete(endpoint: str, params: dict | None = None) -> str:
         return f"Error {response.status_code}: {response.text.strip()}"
     except Exception as e:
         return f"Request failed: {e!s}"
+
+
+_native_mutating_tools = frozenset(
+    {
+        "bn_analysis_abort",
+        "bn_analysis_update",
+        "bn_analysis_update_and_wait",
+        "bn_binary_view_set_active",
+        "bn_calling_convention_set",
+        "bn_comment_delete",
+        "bn_comment_set",
+        "bn_data_variable_define",
+        "bn_data_variable_undefine",
+        "bn_function_prototype_set",
+        "bn_open_item_close",
+        "bn_open_item_save",
+        "bn_project_file_open",
+        "bn_section_create",
+        "bn_section_delete",
+        "bn_section_modify",
+        "bn_symbol_define",
+        "bn_symbol_rename",
+        "bn_symbol_undefine",
+        "bn_type_define",
+        "bn_type_delete",
+        "bn_type_enum_create",
+        "bn_type_enum_modify",
+        "bn_type_rename",
+        "bn_type_struct_create",
+        "bn_type_struct_modify",
+        "bn_type_union_create",
+        "bn_type_union_modify",
+        "bn_variable_rename",
+        "bn_variable_set_type",
+    }
+)
+_native_generation_lock = _threading.Lock()
+_native_generation = ""
+
+
+def _set_native_generation(instance_id: str) -> None:
+    global _native_generation
+    if not instance_id:
+        return
+    with _native_generation_lock:
+        _native_generation = instance_id
+
+
+def _native_expected_instance() -> str:
+    global _native_generation
+    current = _endpoint()
+    if not current.instance_id:
+        return ""
+    with _native_generation_lock:
+        previous = _native_generation
+        _native_generation = current.instance_id
+    if previous and previous != current.instance_id:
+        raise _NativeSessionReset(current.instance_id)
+    return current.instance_id
+
+
+def _native_call(tool: str, arguments: dict) -> object:
+    """Invoke one Binary Ninja 6 native-style tool through the headless host."""
+    try:
+        expected_instance = _native_expected_instance()
+        response = _request(
+            "post",
+            f"native/{tool}",
+            # Opening a canonical path is deduplicated by the host. Every
+            # other mutation has unknown outcome after a lost connection and
+            # must never be replayed automatically.
+            retry_safe=tool == "bn_open_item_open" or tool not in _native_mutating_tools,
+            expected_instance=expected_instance,
+            replay_after_recovery=False,
+            json=arguments,
+            timeout=_effective_timeout(f"native/{tool}", None),
+        )
+    except _NativeSessionReset as exc:
+        _set_native_generation(exc.instance_id)
+        raise RuntimeError(
+            "native_session_reset: the headless Binary Ninja host restarted, so native "
+            "active-view and project state was discarded. Re-list open items and BinaryViews, "
+            "reselect the required BinaryView, and reopen any projects before continuing."
+        ) from exc
+    try:
+        data = response.json()
+    except Exception:
+        data = None
+    if response.ok and data is not None:
+        return data
+
+    description = response.text.strip()
+    if isinstance(data, dict) and "error" in data:
+        error = data["error"]
+        if isinstance(error, dict):
+            code = str(error.get("code") or "native_error")
+            message = str(error.get("message") or error)
+            description = f"{code}: {message}"
+        else:
+            description = str(error)
+    if response.ok:
+        raise RuntimeError(f"{tool} returned an invalid non-JSON response")
+    raise RuntimeError(f"{tool} failed (HTTP {response.status_code}): {description}")
 
 
 @scoped_tool()
@@ -1464,6 +1581,16 @@ def patch_bytes(address: str, data: str, save_to_file: bool = True) -> str:
     if isinstance(result, dict) and "error" in result:
         return f"Error: {result['error']}"
     return str(result)
+
+
+# Binary Ninja 6.0 introduced a native MCP vocabulary. Register the matching
+# tool names on the same restart-safe headless transport so Codex can use the
+# new model even when the product edition does not ship `binaryninja_mcp`.
+from native_v6_tools import harden_native_v6_tools as _harden_native_v6_tools
+from native_v6_tools import register_native_v6_tools as _register_native_v6_tools
+
+_register_native_v6_tools(scoped_tool, _native_call)
+_harden_native_v6_tools(mcp)
 
 
 if __name__ == "__main__":

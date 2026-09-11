@@ -147,6 +147,11 @@ class LauncherTests(unittest.TestCase):
         args = launcher.build_parser().parse_args([])
         self.assertEqual(args.port, 0)
 
+    def test_headless_host_default_capacity_supports_concurrent_agents(self):
+        with mock.patch.dict(headless_host.os.environ, {}, clear=True):
+            args = headless_host.build_parser().parse_args([])
+        self.assertEqual(args.max_open_binaries, 8)
+
     def test_binary_ninja_user_state_is_isolated_per_launcher(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

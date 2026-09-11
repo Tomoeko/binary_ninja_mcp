@@ -9,7 +9,9 @@ This repository contains a Binary Ninja plugin, MCP server, and bridge that enab
 - Seamless, real-time integration between Binary Ninja and MCP clients
 - Enhanced reverse engineering workflow with AI assistance
 - Support for every MCP client (Cline, Claude desktop, Roo Code, etc.)
-- Open multiple binaries and switch the active target automatically
+- Target multiple open binaries deterministically with explicit selectors
+- Headless compatibility with Binary Ninja 6.0.10601's complete 75-tool
+  native `bn_*` MCP vocabulary
 
 ## Examples
 
@@ -77,21 +79,25 @@ For Codex, `--install` installs both the bundled Binary Ninja analysis skill at
 `binary_ninja` MCP server entry. The installer losslessly merges the entry so
 existing environment, enablement, tool-filter, and approval settings survive a
 reinstall. Absolute paths are recorded for the Python interpreter, launcher,
-and bridge environment, so the server does not depend on Binary Ninja's GUI or
-the launching application's working directory. `--uninstall` removes only the
-files and server entry managed by this repository. Start a new Codex task after
-installation so the MCP tool catalog and skill catalog are refreshed.
+and bridge environment, so the server does not depend on the launching
+application's working directory. This workflow never launches or contacts the
+Binary Ninja GUI. `--uninstall` removes only the files and server entry managed
+by this repository. Start a new Codex task after installation so the MCP tool
+catalog and skill catalog are refreshed.
 
-The Codex headless launcher uses an authenticated, OS-assigned loopback port
-for each process, so concurrent Codex tasks cannot attach to one another's
-Binary Ninja host. Each host also receives private writable Binary Ninja user
-state so concurrent native-plugin initialization cannot corrupt the shared
-Plugin Manager status file. When agents share one MCP process, analysis tools
-accept a stable `binary="view:N"` selector or absolute filename; supply it on
-every target-dependent call instead of relying on the mutable `select_binary`
-state. Bare numeric selectors are rejected because internal ids and sorted
-ordinals can collide. With multiple binaries open, an unscoped
-target-dependent request fails closed rather than using another agent's view.
+Codex starts one stdio MCP client per task or subagent. Those clients reuse one
+authenticated, OS-assigned loopback Binary Ninja host keyed by its exact
+runtime and repository source fingerprint; the endpoint and credentials remain
+private to the current user. The host receives isolated writable Binary Ninja
+user state so concurrent native-plugin initialization cannot corrupt the real
+Plugin Manager status file. When agents share this headless host, pass the
+exact type-qualified `binaryView` candidate handle returned by the native
+lifecycle tools as `binary=` on every native active-view call. Extended legacy
+tools use the stable `view:N` selector or an absolute filename. Do not rely on
+the mutable legacy current-view state set by `select_binary`. Bare numeric
+selectors are rejected because internal ids and sorted ordinals can collide.
+With multiple binaries open, an unscoped target-dependent request fails closed
+rather than using another agent's view.
 
 #### Using npm package (Recommended)
 
@@ -148,8 +154,38 @@ Note: Replace `/ABSOLUTE/PATH/TO` with the actual absolute path to your project 
 
 ### Headless Binary Ninja for Codex
 
-The headless launcher starts Binary Ninja's Python API, the local HTTP service, and
-the MCP stdio bridge as one command. The Binary Ninja GUI does not need to be open.
+The headless launcher starts Binary Ninja's Python API, the local HTTP service,
+and the MCP stdio bridge as one command. It never launches, attaches to, or
+automates the Binary Ninja GUI.
+
+#### Binary Ninja 6 native MCP model
+
+Binary Ninja 6.0.10601 defines 75 native MCP tools for file/view management,
+projects, analysis control, program structure, memory reads, function and IL
+inspection, cross-references, symbols, variables, prototypes, calling
+conventions, types, data variables, comments, and section editing. This
+repository exposes those exact `bn_*` names and native-style input schemas on
+its existing headless Codex server, alongside the extended legacy tools.
+
+Vector 35 ships its standalone `binaryninja_mcp` stdio executable only with
+Commercial and Ultimate editions on macOS/Linux; Personal 6.0.10601 contains
+the GUI MCP implementation but not that executable. The compatibility layer
+therefore uses the installed 6.0 Python API inside the repository's isolated
+headless host. It never starts or connects to the Binary Ninja GUI.
+
+Every native file or database opened by the compatibility layer has an
+`openItem` handle of the form `open:view:N`. `bn_binary_view_list` and
+`bn_open_item_open` return stable, type-qualified `binaryView` candidate
+handles of the form `candidate:view:N:<encoded-view-type>`. Pass the returned
+candidate handle verbatim as `binary=` on native active-view tools; it selects
+the exact Raw, Mach-O, ELF, PE, or other view type in the headless process.
+
+The legacy `view:N` selector identifies the open item and its current analyzed
+view. It is not a native, type-qualified `binaryView` candidate handle.
+`bn_binary_view_set_active` changes the headless current analyzed view and may
+create the requested view type, but no GUI selection exists. Calls without an
+explicit selector fail closed when more than one item is resident. The nine
+handle-based lifecycle tools remain unscoped, matching the native model.
 
 First verify the same Python runtime Binary Ninja uses:
 
@@ -197,8 +233,10 @@ Codex is configured with a minimum 30-minute tool-response budget. Reinstalling
 raises shorter startup/tool budgets to these minimums, preserves larger
 user-defined budgets, and does not change the user's tool approval policy.
 
-After Codex restarts, use the `open_binary` MCP tool with an absolute path.
-Opening creates and selects the view promptly, then runs conservative `basic`
+After Codex restarts, use `bn_open_item_list`/`bn_open_item_open` for the native
+Binary Ninja 6 workflow, or use the extended `open_binary` MCP tool with an
+absolute path when you need explicit load settings. Opening establishes the
+headless current analyzed view promptly, then runs conservative `basic`
 analysis in the background so large flat firmware images do not block the MCP
 transport. `get_binary_status` reports the active analysis state, function
 count, platform, and mapped range. An adjacent JSON file with a `base` or
@@ -206,14 +244,18 @@ count, platform, and mapped range. An adjacent JSON file with a `base` or
 `analysis_mode` can also be passed explicitly. Use `analysis_mode="full"` only
 when the additional analysis cost is intentional.
 
-Headless sessions retain at most two native analysis views by default. Exact
+Headless sessions retain at most eight native analysis views by default, which
+allows a full four-agent Codex group to keep two explicitly targeted binaries
+per agent. Exact
 path, symlink, and hard-link aliases reuse one view when their immutable load
 settings match; conflicting analysis mode, platform, image base, or a changed
 on-disk file is rejected instead of silently reusing the wrong analysis. The
-least-recently-used clean view is disposed before a third target opens, and the
+least-recently-used clean view is disposed before a ninth target opens, and the
 versioned recovery manifest is replaced atomically so an evicted target is not
 resurrected after a host restart. Set `BINJA_MCP_MAX_OPEN_BINARIES` to another
-positive integer when a deliberate comparison needs a different bound.
+positive integer when a deliberate comparison needs a different bound. The
+resident-memory ceiling described below remains authoritative regardless of
+this view-count limit.
 
 The host also enforces a 16 GiB resident-memory ceiling. If native analysis
 crosses it, all managed views are aborted and disposed, the empty inventory is
@@ -232,9 +274,10 @@ unset to expose the complete tool set, or retain a narrower user-defined list.
 
 ## Usage
 
-1. Open Binary Ninja and load a binary
-2. Click the button shown at left bottom corner
-3. Start using it through your MCP client
+For Codex/headless use, install the configuration, start a new Codex task, and
+open the target with `bn_open_item_open` or `open_binary`. All analysis runs in
+the isolated Python-API host; this workflow never launches the Binary Ninja
+GUI.
 
 You may now start prompting LLMs about the currently open binary (or binaries). Example prompts:
 
@@ -300,7 +343,7 @@ The following table lists the available MCP functions for use:
 | `make_function_at(address, platform)`                                | Create a function at an address. `platform` optional; use `default` to pick the BinaryView/platform default. |
 | `list_platforms()`                                                   | List all available platform names.                                                                           |
 | `list_binaries()`                                                    | List managed/open binaries with ids and active flag.                                                         |
-| `select_binary(view)`                                                | Select by `view:N`, `ordinal:N`, full path, or an unambiguous basename.                                      |
+| `select_binary(view)`                                                | Set the legacy headless current analyzed view by `view:N`, `ordinal:N`, full path, or unambiguous basename.  |
 | `list_all_strings()`                                                 | List all strings (no pagination; aggregates all pages).                                                      |
 | `list_classes`                                                       | List all namespace/class names in the program.                                                               |
 | `list_data_items`                                                    | List defined data labels and their values.                                                                   |

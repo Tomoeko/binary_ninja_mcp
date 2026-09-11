@@ -16,10 +16,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakeResponse:
-    def __init__(self, payload: dict[str, object]):
+    def __init__(self, payload: dict[str, object], status_code: int = 200):
         self._payload = payload
-        self.ok = True
-        self.status_code = 200
+        self.ok = status_code < 400
+        self.status_code = status_code
         self.encoding = "utf-8"
         self.text = json.dumps(payload)
 
@@ -188,6 +188,94 @@ class BridgeTargetingTests(unittest.TestCase):
         self.assertIn("Applied prototype", result)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["timeout"], self.bridge._DEFAULT_HTTP_TIMEOUT)
+
+    def test_native_domain_errors_propagate_as_mcp_tool_failures(self):
+        response = FakeResponse(
+            {
+                "error": {
+                    "code": "function_not_found",
+                    "message": "No matching function was found",
+                }
+            },
+            status_code=404,
+        )
+        with (
+            mock.patch.object(self.bridge._http, "post", return_value=response),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "function_not_found: No matching function was found",
+            ),
+        ):
+            self.bridge._native_call(
+                "bn_function_info",
+                {"function": "0xffffffffffffffff"},
+            )
+
+    def test_native_read_fails_closed_when_host_generation_changes(self):
+        old = self._host_record("old", 41001)
+        new = self._host_record("new", 41002)
+        runtime = mock.Mock()
+        runtime.ensure_host.return_value = old
+        runtime.recover_after_connection_loss.return_value = new
+        self.bridge._native_generation = "old"
+        self.addCleanup(setattr, self.bridge, "_native_generation", "")
+
+        with (
+            mock.patch.object(self.bridge, "_shared_host_runtime", runtime),
+            mock.patch.object(
+                self.bridge._http,
+                "post",
+                side_effect=requests.exceptions.ConnectionError("reset"),
+            ) as post,
+            self.assertRaisesRegex(RuntimeError, "native_session_reset"),
+        ):
+            self.bridge._native_call("bn_binary_view_get_active", {})
+
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(self.bridge._native_generation, "new")
+        runtime.recover_after_connection_loss.assert_called_once_with("old")
+
+    def test_native_read_retries_when_transport_resets_without_generation_change(self):
+        old = self._host_record("old", 41001)
+        runtime = mock.Mock()
+        runtime.ensure_host.return_value = old
+        runtime.recover_after_connection_loss.return_value = old
+        self.bridge._native_generation = "old"
+        self.addCleanup(setattr, self.bridge, "_native_generation", "")
+
+        with (
+            mock.patch.object(self.bridge, "_shared_host_runtime", runtime),
+            mock.patch.object(
+                self.bridge._http,
+                "post",
+                side_effect=[
+                    requests.exceptions.ConnectionError("reset"),
+                    FakeResponse({"binaryView": None}),
+                ],
+            ) as post,
+        ):
+            result = self.bridge._native_call("bn_binary_view_get_active", {})
+
+        self.assertEqual(result, {"binaryView": None})
+        self.assertEqual(post.call_count, 2)
+        runtime.recover_after_connection_loss.assert_called_once_with("old")
+
+    def test_native_call_detects_a_generation_changed_by_another_request(self):
+        new = self._host_record("new", 41002)
+        runtime = mock.Mock()
+        runtime.ensure_host.return_value = new
+        self.bridge._native_generation = "old"
+        self.addCleanup(setattr, self.bridge, "_native_generation", "")
+
+        with (
+            mock.patch.object(self.bridge, "_shared_host_runtime", runtime),
+            mock.patch.object(self.bridge._http, "post") as post,
+            self.assertRaisesRegex(RuntimeError, "native_session_reset"),
+        ):
+            self.bridge._native_call("bn_binary_view_get_active", {})
+
+        post.assert_not_called()
+        self.assertEqual(self.bridge._native_generation, "new")
 
     def test_default_transport_has_short_connect_and_long_finite_read_budget(self):
         response = FakeResponse({"filename": "/tmp/a.bin", "loaded": True})

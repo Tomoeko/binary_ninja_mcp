@@ -38,6 +38,19 @@ def make_record(instance: str = "instance-12345678", pid: int = 123) -> shared_h
 
 
 class SharedHostLifecycleTests(unittest.TestCase):
+    def test_default_capacity_supports_full_codex_agent_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.dict(shared_host.os.environ, {}, clear=True):
+                config = shared_host.build_shared_host_config(
+                    host_python="/host/python",
+                    bn_python_path=root / "bn-python",
+                    bind_host="127.0.0.1",
+                    bind_port=0,
+                    startup_timeout=45.0,
+                )
+        self.assertEqual(config.max_open_binaries, 8)
+
     def test_versioned_manifest_prunes_views_but_preserves_id_watermark(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
