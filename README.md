@@ -244,6 +244,21 @@ count, platform, and mapped range. An adjacent JSON file with a `base` or
 `analysis_mode` can also be passed explicitly. Use `analysis_mode="full"` only
 when the additional analysis cost is intentional.
 
+Tool responses include readable plain text alongside structured JSON. The text
+view presents code and nested results without JSON escaping; clients should
+consume `structuredContent` for the original machine-readable values. This
+applies to both native and legacy tools, including empty lists and tool errors.
+
+Decompilation and IL requests re-enable the selected function if background
+analysis marks it skipped while a request is waiting. They do not wait for
+analysis of the entire binary. Pending-analysis warnings remain visible when
+the returned text may still change.
+
+For a repeatable cold/repeated decompilation check, run
+`.venv/bin/python3 tests/smoke_function_decompile.py --help`, then supply a binary
+and its function addresses. The smoke test verifies both response forms,
+closes the binary, and removes its temporary host files.
+
 Headless sessions retain at most eight native analysis views by default, which
 allows a full four-agent Codex group to keep two explicitly targeted binaries
 per agent. Exact

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import inspect
 import json
 import os
 import threading
@@ -8,6 +10,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from typing import get_origin
 from unittest import mock
 
 import requests
@@ -65,6 +68,66 @@ class BridgeTargetingTests(unittest.TestCase):
         ):
             properties = manager.get_tool(name).parameters.get("properties", {})
             self.assertNotIn("binary", properties)
+
+    def test_every_registered_tool_returns_readable_text_and_structured_data(self):
+        manager = self.bridge.mcp._tool_manager
+        self.assertGreaterEqual(len(manager._tools), 75)
+        for name, tool in manager._tools.items():
+            with self.subTest(tool=name):
+                signature = inspect.signature(tool.fn)
+                if name.startswith("bn_"):
+                    value = {"name": name, "count": 0, "items": []}
+                    expected = value
+                elif get_origin(signature.return_annotation) is list:
+                    value = ["first", "second"]
+                    expected = {"result": value}
+                else:
+                    self.assertIs(signature.return_annotation, str)
+                    value = "Completed successfully"
+                    expected = {"result": value}
+                arguments = {
+                    parameter.name: 1 if parameter.annotation is int else "fixture"
+                    for parameter in signature.parameters.values()
+                    if parameter.default is inspect.Parameter.empty
+                }
+                # Exercise each real argument model, output model and server
+                # callback, but never execute a binary mutation or HTTP request.
+                with mock.patch.object(tool, "fn", return_value=value):
+                    result = asyncio.run(self.bridge.mcp.call_tool(name, arguments))
+                wire = result.model_dump(by_alias=True)
+                self.assertFalse(wire.get("isError"), wire)
+                self.assertEqual(wire["structuredContent"], expected)
+                self.assertEqual(tool.output_schema["type"], "object")
+                self.assertTrue(wire["content"])
+                for block in wire["content"]:
+                    self.assertEqual(block["type"], "text")
+                    self.assertTrue(block["text"].startswith(name + "\n\n"))
+                    with self.assertRaises(json.JSONDecodeError):
+                        json.loads(block["text"])
+
+    def test_empty_list_and_native_failure_retain_both_presentations(self):
+        manager = self.bridge.mcp._tool_manager
+        tool = manager.get_tool("list_binaries")
+        with mock.patch.object(tool, "fn", return_value=[]):
+            result = asyncio.run(self.bridge.mcp.call_tool("list_binaries", {}))
+        wire = result.model_dump(by_alias=True)
+        self.assertEqual(wire["structuredContent"], {"result": []})
+        self.assertIn("empty list", wire["content"][0]["text"])
+
+        tool = manager.get_tool("bn_analysis_status")
+        with mock.patch.object(tool, "fn", side_effect=RuntimeError("Analysis unavailable")):
+            result = asyncio.run(self.bridge.mcp.call_tool("bn_analysis_status", {}))
+        wire = result.model_dump(by_alias=True)
+        self.assertTrue(wire["isError"])
+        self.assertIn("Analysis unavailable", wire["structuredContent"]["error"]["message"])
+        self.assertIn("Analysis unavailable", wire["content"][0]["text"])
+
+    def test_invalid_tool_arguments_have_plaintext_and_structured_error(self):
+        result = asyncio.run(self.bridge.mcp.call_tool("bn_analysis_status", {"unexpected": True}))
+        wire = result.model_dump(by_alias=True)
+        self.assertTrue(wire["isError"])
+        self.assertIn("error", wire["structuredContent"])
+        self.assertTrue(wire["content"][0]["text"].startswith("bn_analysis_status\n\n"))
 
     def test_target_and_auth_apply_to_every_request_in_one_tool_call(self):
         calls: list[tuple[str, dict]] = []

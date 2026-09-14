@@ -1,4 +1,5 @@
 anthropic>=0.49.0
-mcp[cli]>=1.6.0
+# SDK 1.19 adds explicit CallToolResult support to the wire handler.
+mcp[cli]>=1.19.0
 requests>=2.32.3
 tomlkit>=0.13.2,<1

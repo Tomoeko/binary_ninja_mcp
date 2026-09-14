@@ -890,6 +890,11 @@ def _request_function_forms(
 
     deadline = time.monotonic() + _function_analysis_timeout()
     while missing:
+        # A cold basic-analysis pass can mark the function skipped after the
+        # initial readiness check. Re-enable it when that happens; polling IL
+        # alone cannot restart a skipped function, even once the view is idle.
+        if _enable_on_demand_analysis(function):
+            requested = True
         for attribute in missing:
             values[attribute] = _attr(function, attribute)
         missing = [attribute for attribute, value in values.items() if value is None]

@@ -223,6 +223,12 @@ def main() -> int:
         result = response.get("result") or {}
         if result.get("isError"):
             raise RuntimeError(f"Tool {name} failed: {result}")
+        structured = result.get("structuredContent")
+        if isinstance(structured, dict):
+            if name not in NATIVE_V6_TOOL_NAMES and set(structured) == {"result"}:
+                value = structured["result"]
+                return value if isinstance(value, str) else json.dumps(value)
+            return json.dumps(structured)
         content = result.get("content") or []
         if not content or content[0].get("type") != "text":
             raise RuntimeError(f"Tool {name} returned no text: {result}")

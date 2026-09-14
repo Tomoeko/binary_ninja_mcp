@@ -30,18 +30,13 @@ except ModuleNotFoundError:
     _sys.path.insert(0, _os.path.dirname(_os.path.realpath(__file__)))
     from shared_host import SharedHostRuntime as _SharedHostRuntime
 
-try:
-    from mcp.server.fastmcp import FastMCP
-except ModuleNotFoundError:
-    # MCP SDK 2.x renamed the ergonomic server class while retaining the
-    # decorator and stdio run interfaces used by this bridge.
-    from mcp.server.mcpserver import MCPServer as FastMCP
+from mcp_server import BinaryNinjaMCP
 
 _binja_host = _os.environ.get("BINJA_MCP_HOST", "localhost")
 _binja_port = _os.environ.get("BINJA_MCP_PORT", "9009")
 _binja_auth_token = _os.environ.get("BINJA_MCP_AUTH_TOKEN", "")
 binja_server_url = f"http://{_binja_host}:{_binja_port}"
-mcp = FastMCP("binja-mcp")
+mcp = BinaryNinjaMCP("binja-mcp")
 _target_binary = _contextvars.ContextVar("binary_ninja_mcp_target", default="")
 _shared_host_runtime = _SharedHostRuntime.from_environment()
 
@@ -277,10 +272,15 @@ def scoped_tool(*decorator_args, **decorator_kwargs):
     register = _raw_mcp_tool(*decorator_args, **decorator_kwargs)
 
     def decorate(function):
+        signature = _inspect.signature(function)
+        if signature.return_annotation is list:
+            # A bare list annotation does not produce an output schema in the
+            # MCP SDK. Preserve its elements while enabling structured results.
+            signature = signature.replace(return_annotation=list[object])
+            function.__signature__ = signature
         if function.__name__ in _unscoped_tool_names:
             return register(function)
 
-        signature = _inspect.signature(function)
         binary_parameter = _inspect.Parameter(
             "binary",
             kind=_inspect.Parameter.KEYWORD_ONLY,

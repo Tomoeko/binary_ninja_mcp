@@ -6,6 +6,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_PACKAGE = "_native_mcp_inspection_fixture"
@@ -222,6 +223,51 @@ class PendingFunction(FakeFunction):
     @hlil.setter
     def hlil(self, value):
         self._hlil = value
+
+
+class FakeAnalysisClock:
+    """Advance polling deterministically without sleeping or starting analysis threads."""
+
+    def __init__(self, on_sleep=None):
+        self.elapsed = 0.0
+        self.reads = 0
+        self.on_sleep = on_sleep
+
+    def monotonic(self):
+        self.reads += 1
+        if self.reads > 1000:
+            raise AssertionError("Analysis polling did not reach its deadline")
+        return self.elapsed
+
+    def sleep(self, seconds):
+        if seconds <= 0:
+            raise AssertionError("Analysis polling did not advance time")
+        self.elapsed += seconds
+        if self.on_sleep is not None:
+            self.on_sleep(self.elapsed)
+
+
+class DeferredBasicAnalysisFunction(FakeFunction):
+    """The background basic pass decides to skip this function after a request starts."""
+
+    def __init__(self, platform):
+        super().__init__("entry", 0x1000, platform)
+        self.saved_hlil = self.hlil
+        self.saved_pseudo_c = self.pseudo_c
+        self.hlil = None
+        self.pseudo_c = None
+        self.basic_pass_finished = False
+
+    def finish_basic_pass(self, _elapsed):
+        if not self.basic_pass_finished:
+            self.basic_pass_finished = True
+            self.analysis_skipped = True
+
+    def reanalyze(self):
+        super().reanalyze()
+        if self.basic_pass_finished and not self.analysis_skipped:
+            self.hlil = self.saved_hlil
+            self.pseudo_c = self.saved_pseudo_c
 
 
 class FakeSegment:
@@ -745,6 +791,89 @@ class NativeMcpInspectionTests(unittest.TestCase):
         self.assertIn("return x0", result["text"])
         self.assertTrue(result["analysisEnabledOnDemand"])
         self.assertEqual(pending.reanalysis_count, 1)
+
+    def test_background_basic_pass_skip_is_reenabled_during_form_polling(self):
+        for tool in ("bn_function_decompile", "bn_function_il"):
+            with self.subTest(tool=tool):
+                pending = DeferredBasicAnalysisFunction(self.view.platform)
+                self.view.entry = pending
+                self.view.functions[0] = pending
+                self.assertFalse(pending.analysis_skipped)
+                clock = FakeAnalysisClock(pending.finish_basic_pass)
+                with (
+                    mock.patch.object(inspection.time, "monotonic", clock.monotonic),
+                    mock.patch.object(inspection.time, "sleep", clock.sleep),
+                    mock.patch.object(inspection, "_function_analysis_timeout", return_value=0.2),
+                    mock.patch.object(
+                        self.view,
+                        "update_analysis_and_wait",
+                        side_effect=AssertionError(
+                            "Decompilation must not wait for the whole view"
+                        ),
+                    ),
+                ):
+                    result = self.dispatch(tool, {"function": "entry"})
+                self.assertTrue(pending.basic_pass_finished)
+                self.assertFalse(pending.analysis_skipped)
+                self.assertEqual(pending.reanalysis_count, 2)
+                self.assertTrue(result["analysisEnabledOnDemand"])
+                expected_text = (
+                    "pseudo_c_result" if tool == "bn_function_decompile" else "return x0"
+                )
+                self.assertIn(expected_text, result["text"])
+                self.assertLess(clock.elapsed, 0.2)
+                self.assertEqual(self.view.update_count, 0)
+
+    def test_warm_function_forms_do_not_reanalyze_or_wait(self):
+        with (
+            mock.patch.object(
+                inspection.time, "sleep", side_effect=AssertionError("Warm forms must not poll")
+            ),
+            mock.patch.object(
+                self.view,
+                "update_analysis_and_wait",
+                side_effect=AssertionError("Warm forms must not wait for the whole view"),
+            ),
+        ):
+            decompiled = self.dispatch("bn_function_decompile", {"function": "entry"})
+            il = self.dispatch("bn_function_il", {"function": "entry", "level": "hlil"})
+        self.assertFalse(decompiled["analysisEnabledOnDemand"])
+        self.assertFalse(il["analysisEnabledOnDemand"])
+        self.assertEqual(self.view.entry.reanalysis_count, 0)
+        self.assertEqual(self.view.update_count, 0)
+        self.assertIn("pseudo_c_result", decompiled["text"])
+        self.assertIn("return x0", il["text"])
+
+    def test_missing_pseudo_c_and_delayed_hlil_share_one_polling_deadline(self):
+        function = self.view.entry
+        available_hlil = function.hlil
+        function.hlil = None
+        function.pseudo_c = None
+
+        def publish_hlil(elapsed):
+            if elapsed >= 0.15:
+                function.hlil = available_hlil
+
+        clock = FakeAnalysisClock(publish_hlil)
+        with (
+            mock.patch.object(inspection.time, "monotonic", clock.monotonic),
+            mock.patch.object(inspection.time, "sleep", clock.sleep),
+            mock.patch.object(inspection, "_function_analysis_timeout", return_value=0.2),
+            mock.patch.object(
+                self.view,
+                "update_analysis_and_wait",
+                side_effect=AssertionError("Unavailable forms must not wait for the whole view"),
+            ),
+            self.assertRaises(common.NativeMcpError) as unavailable,
+        ):
+            self.dispatch("bn_function_decompile", {"function": "entry"})
+        self.assertEqual(unavailable.exception.code, "function_text_unavailable")
+        self.assertIs(function.hlil, available_hlil)
+        self.assertIsNone(function.pseudo_c)
+        self.assertGreaterEqual(clock.elapsed, 0.2)
+        self.assertLessEqual(clock.elapsed, 0.25)
+        self.assertEqual(function.reanalysis_count, 1)
+        self.assertEqual(self.view.update_count, 0)
 
     def test_type_parse_failures_and_dispatch_errors_are_domain_errors(self):
         with self.assertRaises(common.NativeMcpError) as parse_error:
