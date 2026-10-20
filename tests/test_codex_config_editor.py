@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import stat
 import subprocess
 import sys
@@ -75,6 +77,68 @@ class CodexConfigEditorTests(unittest.TestCase):
             self.assertEqual(config.read_bytes(), first)
             self.assertEqual(second_stat.st_ino, first_stat.st_ino)
             self.assertEqual(second_stat.st_mtime_ns, first_stat.st_mtime_ns)
+
+    def test_missing_relative_and_deleted_cwd_use_the_installed_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            file_path = root / "not-a-directory"
+            file_path.touch()
+            for value in [None, "", ".", str(root / "deleted-project"), str(file_path)]:
+                with self.subTest(cwd=value):
+                    config = root / "config.toml"
+                    source = '[mcp_servers.binary_ninja]\ncommand = "old"\nargs = []\n'
+                    if value is not None:
+                        source += f"cwd = {json.dumps(value)}\n"
+                    config.write_text(source, encoding="utf-8")
+                    self.assertTrue(self._update(config))
+                    entry = tomllib.loads(config.read_text())["mcp_servers"]["binary_ninja"]
+                    self.assertEqual(entry["cwd"], str(REPO_ROOT))
+                    self.assertFalse(self._update(config))
+
+    def test_existing_custom_cwd_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            custom = Path(directory) / "custom working directory"
+            custom.mkdir()
+            config = Path(directory) / "config.toml"
+            config.write_text(
+                '[mcp_servers.binary_ninja]\ncommand = "old"\nargs = []\n'
+                f"cwd = {json.dumps(str(custom))} # keep-directory\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(self._update(config))
+            entry = tomllib.loads(config.read_text())["mcp_servers"]["binary_ninja"]
+            self.assertEqual(entry["cwd"], str(custom))
+            self.assertIn("# keep-directory", config.read_text())
+            self.assertFalse(self._update(config))
+
+    @unittest.skipIf(os.name == "nt", "Windows cannot remove a process's working directory")
+    def test_configured_process_starts_after_the_chat_directory_is_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.toml"
+            self._update(config)
+            entry = tomllib.loads(config.read_text())["mcp_servers"]["binary_ninja"]
+            project = root / "renamed-project"
+            project.mkdir()
+            # Reproduce the chat host retaining a cwd that was removed after a
+            # repository rename, without changing the test runner's own cwd.
+            program = (
+                "import os,subprocess,sys; "
+                "os.chdir(sys.argv[1]); os.rmdir(sys.argv[1]); "
+                "command=[sys.executable,'-c','import os; print(os.getcwd())']; "
+                "failed=False; "
+                "\ntry: subprocess.run(command,cwd=sys.argv[1],check=True)"
+                "\nexcept FileNotFoundError: failed=True"
+                "\nassert failed; "
+                "subprocess.run(command,cwd=sys.argv[2],check=True)"
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", program, str(project), entry["cwd"]],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertEqual(Path(result.stdout.strip()), REPO_ROOT)
 
     def test_inline_table_forms_are_updated_without_losing_siblings(self):
         samples = (

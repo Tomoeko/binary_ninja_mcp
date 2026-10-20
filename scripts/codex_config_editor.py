@@ -21,6 +21,7 @@ import tomlkit
 from tomlkit.items import InlineTable
 
 SERVER_NAME = "binary_ninja"
+DEFAULT_WORKING_DIRECTORY = str(Path(__file__).resolve().parents[1])
 MINIMUM_STARTUP_TIMEOUT_SEC = 45
 MINIMUM_TOOL_TIMEOUT_SEC = 1800
 _HTTP_TRANSPORT_FIELDS = frozenset(
@@ -39,6 +40,7 @@ _HTTP_TRANSPORT_FIELDS = frozenset(
 _OWNED_FIELDS = _HTTP_TRANSPORT_FIELDS | {
     "command",
     "args",
+    "cwd",
     "startup_timeout_sec",
     "tool_timeout_sec",
 }
@@ -80,12 +82,21 @@ def _valid_timeout(value: object, minimum: int) -> bool:
     )
 
 
-def _entry_is_current(server: dict | None, command: str, args: list[str]) -> bool:
+def _working_directory(server: dict | None) -> str:
+    """Keep a valid explicit directory; never inherit a chat's project cwd."""
+    value = (server or {}).get("cwd")
+    if isinstance(value, str) and Path(value).is_absolute() and Path(value).is_dir():
+        return value
+    return DEFAULT_WORKING_DIRECTORY
+
+
+def _entry_is_current(server: dict | None, command: str, args: list[str], cwd: str) -> bool:
     if server is None:
         return False
     return (
         server.get("command") == command
         and server.get("args") == args
+        and server.get("cwd") == cwd
         and _valid_timeout(server.get("startup_timeout_sec"), MINIMUM_STARTUP_TIMEOUT_SEC)
         and _valid_timeout(server.get("tool_timeout_sec"), MINIMUM_TOOL_TIMEOUT_SEC)
         and not _HTTP_TRANSPORT_FIELDS.intersection(server)
@@ -311,10 +322,12 @@ def update_codex_mcp_entry(
     args: Sequence[str],
     validator: Callable[[bytes], None] | None = None,
 ) -> bool:
-    """Update only this repository's paths and minimum wait budgets.
+    """Update this repository's paths, launch directory and minimum wait budgets.
 
     Existing approval policy, environment, enablement, tool filters, custom
     fields, comments, and table spelling are left under the user's control.
+    An existing absolute working directory is preserved while it exists;
+    missing, relative or deleted directories use the installed repository.
     Returns ``True`` only when the configuration bytes were changed.
     """
     if not command:
@@ -350,7 +363,8 @@ def _update_locked(
 
     before_unowned = _unowned_server_values(document)
     before_server = _server_value(document)
-    if _entry_is_current(before_server, command, normalized_args):
+    cwd = _working_directory(before_server)
+    if _entry_is_current(before_server, command, normalized_args, cwd):
         return False
 
     server = _editable_server(document)
@@ -361,6 +375,7 @@ def _update_locked(
         server.pop(field, None)
     server["command"] = command
     server["args"] = normalized_args
+    server["cwd"] = cwd
     if not _valid_timeout(server.get("startup_timeout_sec"), MINIMUM_STARTUP_TIMEOUT_SEC):
         server["startup_timeout_sec"] = MINIMUM_STARTUP_TIMEOUT_SEC
     if not _valid_timeout(server.get("tool_timeout_sec"), MINIMUM_TOOL_TIMEOUT_SEC):
@@ -376,7 +391,7 @@ def _update_locked(
         raise RuntimeError(f"Generated Codex config is not valid TOML: {exc}") from exc
 
     after_server = _server_value(validated)
-    if not _entry_is_current(after_server, command, normalized_args):
+    if not _entry_is_current(after_server, command, normalized_args, cwd):
         raise RuntimeError("Generated Codex MCP entry failed postcondition validation")
     if _unowned_server_values(validated) != before_unowned:
         raise RuntimeError("Generated Codex MCP entry changed an unowned setting")

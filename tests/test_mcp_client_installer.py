@@ -150,6 +150,8 @@ class CodexMcpInstallerTests(unittest.TestCase):
                 "/opt/python3.13",
                 [
                     str(REPO_ROOT / "scripts" / "run_headless_mcp.py"),
+                    "--python",
+                    "/opt/python3.13",
                     "--bridge-python",
                     "/tmp/bridge/python",
                 ],

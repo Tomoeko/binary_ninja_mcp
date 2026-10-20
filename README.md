@@ -79,8 +79,12 @@ For Codex, `--install` installs both the bundled Binary Ninja analysis skill at
 `binary_ninja` MCP server entry. The installer losslessly merges the entry so
 existing environment, enablement, tool-filter, and approval settings survive a
 reinstall. Absolute paths are recorded for the Python interpreter, launcher,
-and bridge environment, so the server does not depend on the launching
-application's working directory. This workflow never launches or contacts the
+and bridge environment. The server starts in the installed repository, so
+renaming or removing a chat's project directory does not prevent MCP startup.
+An existing absolute custom MCP working directory is preserved while it exists;
+reinstalling repairs missing or stale directories. The native Python interpreter
+is also passed explicitly, independent of the desktop application's PATH.
+This workflow never launches or contacts the
 Binary Ninja GUI. `--uninstall` removes only the files and server entry managed
 by this repository. Start a new Codex task after installation so the MCP tool
 catalog and skill catalog are refreshed.
@@ -217,8 +221,12 @@ manual installation, add the launcher to Codex's MCP configuration:
 
 ```toml
 [mcp_servers.binary_ninja]
-command = "python3.13"
-args = ["/ABSOLUTE/PATH/TO/binary_ninja_mcp/scripts/run_headless_mcp.py"]
+command = "/absolute/path/to/python3.13"
+cwd = "/absolute/path/to/binary_ninja_mcp"
+args = [
+  "/absolute/path/to/binary_ninja_mcp/scripts/run_headless_mcp.py",
+  "--python", "/absolute/path/to/python3.13",
+]
 startup_timeout_sec = 45
 tool_timeout_sec = 1800
 ```
@@ -258,6 +266,11 @@ For a repeatable cold/repeated decompilation check, run
 `.venv/bin/python3 tests/smoke_function_decompile.py --help`, then supply a binary
 and its function addresses. The smoke test verifies both response forms,
 closes the binary, and removes its temporary host files.
+
+To validate the installed Codex entry through initialization, tool discovery and
+decompilation, run `.venv/bin/python3 tests/smoke_headless_mcp.py --codex-config
+"${CODEX_HOME:-$HOME/.codex}/config.toml"`. This uses the configured command,
+arguments and working directory.
 
 Headless sessions retain at most eight native analysis views by default, which
 allows a full four-agent Codex group to keep two explicitly targeted binaries

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -72,6 +73,10 @@ def _stop_test_hosts(pids: set[int]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--python", default="python3.13")
+    parser.add_argument(
+        "--codex-config",
+        help="use the installed binary_ninja command, arguments and cwd from this TOML file",
+    )
     parser.add_argument("--binary", default=str(REPO_ROOT / "example/chal"))
     parser.add_argument(
         "--open-binary",
@@ -125,6 +130,14 @@ def main() -> int:
         "--startup-timeout",
         "30",
     ]
+    working_directory = None
+    if args.codex_config:
+        config = tomllib.loads(Path(args.codex_config).read_text(encoding="utf-8"))
+        server = config["mcp_servers"]["binary_ninja"]
+        working_directory = server.get("cwd")
+        if not working_directory or not Path(working_directory).is_absolute():
+            parser.error("the installed MCP entry needs an absolute cwd")
+        command = [server["command"], *server["args"], "--binary", str(Path(args.binary).resolve())]
     if args.port:
         command.extend(["--port", str(args.port)])
     environment = os.environ.copy()
@@ -145,6 +158,7 @@ def main() -> int:
         stderr=subprocess.PIPE,
         text=True,
         env=environment,
+        cwd=working_directory,
     )
     assert process.stdin and process.stdout and process.stderr
     native_temp_dir = None

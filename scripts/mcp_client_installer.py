@@ -30,6 +30,8 @@ CODEX_SKILL_NAME = "binary-ninja"
 CODEX_SKILL_FILES = ("SKILL.md", os.path.join("agents", "openai.yaml"))
 CODEX_CONFIG_EDITOR_REQUIREMENT = "tomlkit>=0.13.2,<1"
 MACOS_CODEX_APP_EXECUTABLES = (
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+    "/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
     "/Applications/ChatGPT.app/Contents/Resources/codex",
     "/Applications/Codex.app/Contents/Resources/codex",
 )
@@ -358,6 +360,8 @@ def install_codex_mcp_server(
         codex = _codex_executable()
         server_args = [
             _headless_entrypoint(),
+            "--python",
+            host_python,
             "--bridge-python",
             bridge_python,
         ]
