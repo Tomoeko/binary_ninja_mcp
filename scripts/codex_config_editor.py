@@ -43,6 +43,7 @@ _OWNED_FIELDS = _HTTP_TRANSPORT_FIELDS | {
     "cwd",
     "startup_timeout_sec",
     "tool_timeout_sec",
+    "required",
 }
 
 
@@ -99,6 +100,7 @@ def _entry_is_current(server: dict | None, command: str, args: list[str], cwd: s
         and server.get("cwd") == cwd
         and _valid_timeout(server.get("startup_timeout_sec"), MINIMUM_STARTUP_TIMEOUT_SEC)
         and _valid_timeout(server.get("tool_timeout_sec"), MINIMUM_TOOL_TIMEOUT_SEC)
+        and isinstance(server.get("required"), bool)
         and not _HTTP_TRANSPORT_FIELDS.intersection(server)
     )
 
@@ -322,7 +324,7 @@ def update_codex_mcp_entry(
     args: Sequence[str],
     validator: Callable[[bytes], None] | None = None,
 ) -> bool:
-    """Update this repository's paths, launch directory and minimum wait budgets.
+    """Update paths, launch directory, wait budgets and default startup readiness.
 
     Existing approval policy, environment, enablement, tool filters, custom
     fields, comments, and table spelling are left under the user's control.
@@ -376,6 +378,11 @@ def _update_locked(
     server["command"] = command
     server["args"] = normalized_args
     server["cwd"] = cwd
+    # Optional servers get only a short catalog grace period in Codex, even
+    # when startup_timeout_sec is much larger. Wait for this bridge by default
+    # so its tools are available on the first turn in every local chat.
+    # Preserve an explicit user opt-out, just like enabled/tool policy.
+    server.setdefault("required", True)
     if not _valid_timeout(server.get("startup_timeout_sec"), MINIMUM_STARTUP_TIMEOUT_SEC):
         server["startup_timeout_sec"] = MINIMUM_STARTUP_TIMEOUT_SEC
     if not _valid_timeout(server.get("tool_timeout_sec"), MINIMUM_TOOL_TIMEOUT_SEC):

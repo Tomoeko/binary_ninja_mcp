@@ -273,6 +273,15 @@ def _binary_ninja_python() -> str:
     candidate = shutil.which("python3.13")
     if candidate:
         return os.path.abspath(candidate)
+    # GUI plugin auto-setup may inherit only the system PATH.
+    if sys.platform == "darwin":
+        for candidate in (
+            "/opt/homebrew/bin/python3.13",
+            "/opt/local/bin/python3.13",
+            "/usr/local/bin/python3.13",
+        ):
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
     raise RuntimeError(
         "Binary Ninja headless mode requires Python 3.13. Install it or set "
         "BINJA_MCP_PYTHON to its absolute executable path."
@@ -612,6 +621,12 @@ def main():
     )
     parser.add_argument("--config", action="store_true", help="Print generic MCP config JSON")
     parser.add_argument("--quiet", action="store_true", help="Reduce output noise")
+    parser.add_argument(
+        "--client",
+        choices=("all", "codex"),
+        default="all",
+        help="Configure only the selected client (default: all supported clients)",
+    )
     args = parser.parse_args()
 
     if args.install and args.uninstall:
@@ -623,9 +638,12 @@ def main():
         return
 
     if args.uninstall:
-        install_mcp_servers(uninstall=True, quiet=args.quiet)
+        if args.client == "all":
+            install_mcp_servers(uninstall=True, quiet=args.quiet)
         install_codex_mcp_server(uninstall=True, quiet=args.quiet)
         install_codex_skill(uninstall=True, quiet=args.quiet)
+        if args.client != "all":
+            return
         # Also remove auto-setup sentinel so the plugin can re-run setup later
         sentinel = os.path.join(_repo_root(), ".mcp_auto_setup_done")
         try:
@@ -641,9 +659,12 @@ def main():
 
     # Default action is install if no flag is provided
     if args.install or (not args.uninstall and not args.config):
-        install_mcp_servers(quiet=args.quiet)
+        if args.client == "all":
+            install_mcp_servers(quiet=args.quiet)
         install_codex_mcp_server(quiet=args.quiet)
         install_codex_skill(quiet=args.quiet)
+        if not args.quiet:
+            print("Restart Codex to refresh MCP tools in existing chats.")
 
 
 if __name__ == "__main__":

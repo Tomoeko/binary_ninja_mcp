@@ -45,6 +45,7 @@ Please install the MCP client before you install Binary Ninja MCP so that the MC
     5. Windsurf
     6. Claude Code
     7. LM Studio
+    8. Codex
 
 ### Extension Installation
 
@@ -72,6 +73,7 @@ You can also manage MCP client entries from the command line:
 python scripts/mcp_client_installer.py --install    # auto setup supported MCP clients
 python scripts/mcp_client_installer.py --uninstall  # remove entries and delete `.mcp_auto_setup_done`
 python scripts/mcp_client_installer.py --config     # print a generic JSON config snippet
+python scripts/mcp_client_installer.py --install --client codex  # repair only Codex
 ```
 
 For Codex, `--install` installs both the bundled Binary Ninja analysis skill at
@@ -86,8 +88,16 @@ reinstalling repairs missing or stale directories. The native Python interpreter
 is also passed explicitly, independent of the desktop application's PATH.
 This workflow never launches or contacts the
 Binary Ninja GUI. `--uninstall` removes only the files and server entry managed
-by this repository. Start a new Codex task after installation so the MCP tool
-catalog and skill catalog are refreshed.
+by this repository. Restart Codex after installation to refresh MCP connections
+and skills in existing chats. Newly started local tasks use the global entry
+regardless of their project directory. Remote/cloud environments and a different
+`CODEX_HOME` need their own installation.
+
+Binary Ninja's automatic setup checks Codex independently of the legacy
+`.mcp_auto_setup_done` marker and other clients' JSON entries. A working Claude
+or Cursor entry cannot suppress a missing Codex registration or skill. Missing
+or stale Codex files are repaired through the same installer; failures are
+logged and retried on the next plugin load.
 
 Codex starts one stdio MCP client per task or subagent. Those clients reuse one
 authenticated, OS-assigned loopback Binary Ninja host keyed by its exact
@@ -229,7 +239,17 @@ args = [
 ]
 startup_timeout_sec = 45
 tool_timeout_sec = 1800
+required = true
 ```
+
+The installer defaults `required` to `true` so Codex waits for the MCP connection
+before building a chat's tool catalog. Increasing `startup_timeout_sec` alone
+does not ensure this: [Codex gives optional MCP servers a short startup grace
+period](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
+An explicit existing `required = false` is preserved, as are disabled-server and
+tool-filter policies. A failed required connection surfaces a startup error
+instead of silently leaving the chat without Binary Ninja tools. Only the
+lightweight bridge starts at this point; native analysis remains lazy.
 
 The bridge uses a five-second loopback connection timeout and a finite
 29-minute response-read timeout. Binary Ninja analysis requests are serialized
@@ -302,7 +322,7 @@ unset to expose the complete tool set, or retain a narrower user-defined list.
 
 ## Usage
 
-For Codex/headless use, install the configuration, start a new Codex task, and
+For Codex/headless use, install the configuration, restart Codex, and
 open the target with `bn_open_item_open` or `open_binary`. All analysis runs in
 the isolated Python-API host; this workflow never launches the Binary Ninja
 GUI.

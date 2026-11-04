@@ -38,6 +38,31 @@ class CodexConfigEditorTests(unittest.TestCase):
             ],
         )
 
+    def test_registration_waits_for_tools_and_preserves_explicit_optional_policy(self):
+        for required in (None, False, True):
+            with self.subTest(required=required), tempfile.TemporaryDirectory() as directory:
+                config = Path(directory) / "config.toml"
+                source = '[mcp_servers.binary_ninja]\ncommand = "old"\n'
+                if required is not None:
+                    source += f"required = {str(required).lower()} # startup-policy\n"
+                config.write_text(source, encoding="utf-8")
+                self.assertTrue(self._update(config))
+                entry = tomllib.loads(config.read_text())["mcp_servers"]["binary_ninja"]
+                self.assertIs(entry["required"], True if required is None else required)
+                if required is not None:
+                    self.assertIn("# startup-policy", config.read_text())
+                self.assertFalse(self._update(config))
+
+    def test_current_paths_still_migrate_an_implicit_optional_registration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.toml"
+            self._update(config)
+            config.write_text(config.read_text().replace("required = true\n", ""))
+            self.assertTrue(self._update(config))
+            entry = tomllib.loads(config.read_text())["mcp_servers"]["binary_ninja"]
+            self.assertTrue(entry["required"])
+            self.assertFalse(self._update(config))
+
     def test_quoted_table_multiline_decoys_and_unowned_settings_survive(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "config.toml"

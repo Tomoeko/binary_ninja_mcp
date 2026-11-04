@@ -1,6 +1,10 @@
 import json
+import logging
 import os
+import subprocess
 import sys
+import tomllib
+from pathlib import Path
 
 from .python_detection import copy_python_env, create_venv_with_system_python, get_python_executable
 
@@ -149,12 +153,76 @@ def _targets() -> dict:
         return {}
 
 
+def _install_codex_client(quiet: bool) -> int:
+    """Reconcile Codex independently of the legacy JSON-client sentinel.
+
+    A marker (or a working Claude/Cursor entry) says nothing about Codex's
+    global TOML registration. Use the canonical installer when that registration
+    or the bundled skill is missing/stale, without rewriting other clients.
+    """
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    if not codex_home.is_dir():
+        return 0
+    try:
+        root = Path(_repo_root()).resolve()
+        config_path = codex_home / "config.toml"
+        config = (
+            tomllib.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+        )
+        server = config.get("mcp_servers", {}).get("binary_ninja", {})
+        args = server.get("args", [])
+        command = server.get("command", "")
+        cwd = Path(server.get("cwd") or ".")
+        current = (
+            isinstance(command, str)
+            and Path(command).is_absolute()
+            and Path(command).is_file()
+            and isinstance(args, list)
+            and bool(args)
+            and args[0] == str(root / "scripts" / "run_headless_mcp.py")
+            and cwd.is_absolute()
+            and cwd.is_dir()
+            and isinstance(server.get("required"), bool)
+        )
+        for relative in ("SKILL.md", "agents/openai.yaml"):
+            source = root / "skills" / "binary-ninja" / relative
+            target = codex_home / "skills" / "binary-ninja" / relative
+            current = current and target.is_file() and source.read_bytes() == target.read_bytes()
+        if current:
+            return 0
+        result = subprocess.run(
+            [
+                _ensure_local_venv(),
+                str(root / "scripts" / "mcp_client_installer.py"),
+                "--install",
+                "--client",
+                "codex",
+                *(["--quiet"] if quiet else []),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "installer failed")
+        if not quiet and result.stdout:
+            print(result.stdout.rstrip())
+        return 1
+    except Exception as error:
+        # Keep other clients working, but leave Codex eligible for retry on
+        # the next load and make installation failures visible in the log.
+        logging.getLogger(__name__).warning("Codex MCP auto-setup failed: %s", error)
+        return 0
+
+
 def install_mcp_clients(quiet: bool = True) -> int:
     """Install MCP server entries for supported clients.
 
     Returns the number of configs modified. Creates a sentinel to avoid
     re-running on every Binary Ninja start.
     """
+    codex_modified = _install_codex_client(quiet)
     sentinel = _sentinel_path()
     server_key = "binary_ninja_mcp"
     if os.path.exists(sentinel):
@@ -171,7 +239,7 @@ def install_mcp_clients(quiet: bool = True) -> int:
                         continue
                     cfg = json.loads(data)
                 if isinstance(cfg, dict) and server_key in cfg.get("mcpServers", {}):
-                    return 0
+                    return codex_modified
             # No installs found; ignore the sentinel and continue
         except Exception:
             # On any error, fall through and attempt install
@@ -179,7 +247,7 @@ def install_mcp_clients(quiet: bool = True) -> int:
 
     targets = _targets()
     if not targets:
-        return 0
+        return codex_modified
 
     env: dict[str, str] = {}
     copy_python_env(env)
@@ -243,4 +311,4 @@ def install_mcp_clients(quiet: bool = True) -> int:
         except Exception:
             pass
 
-    return modified
+    return modified + codex_modified

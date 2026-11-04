@@ -61,6 +61,42 @@ class CodexSkillInstallerTests(unittest.TestCase):
 
 
 class CodexMcpInstallerTests(unittest.TestCase):
+    def test_codex_only_cli_does_not_rewrite_other_clients(self):
+        for action in ("--install", "--uninstall"):
+            with (
+                self.subTest(action=action),
+                mock.patch.object(
+                    installer.sys, "argv", ["installer", action, "--client", "codex"]
+                ),
+                mock.patch.object(installer, "install_mcp_servers") as legacy,
+                mock.patch.object(installer, "install_codex_mcp_server") as server,
+                mock.patch.object(installer, "install_codex_skill") as skill,
+                mock.patch.object(installer.os, "remove") as remove,
+                mock.patch("builtins.print"),
+            ):
+                installer.main()
+                legacy.assert_not_called()
+                remove.assert_not_called()
+                server.assert_called_once()
+                skill.assert_called_once()
+                if action == "--uninstall":
+                    self.assertTrue(server.call_args.kwargs["uninstall"])
+                    self.assertTrue(skill.call_args.kwargs["uninstall"])
+
+    def test_macos_auto_setup_finds_native_python_with_a_gui_path(self):
+        with (
+            mock.patch.dict(installer.os.environ, {"BINJA_MCP_PYTHON": ""}),
+            mock.patch.object(installer.sys, "platform", "darwin"),
+            mock.patch.object(installer.shutil, "which", return_value=None),
+            mock.patch.object(
+                installer.os.path,
+                "isfile",
+                side_effect=lambda path: path == "/opt/local/bin/python3.13",
+            ),
+            mock.patch.object(installer.os, "access", return_value=True),
+        ):
+            self.assertEqual(installer._binary_ninja_python(), "/opt/local/bin/python3.13")
+
     def test_macos_prefers_the_app_cli_used_after_restart(self):
         app_cli = installer.MACOS_CODEX_APP_EXECUTABLES[0]
         with (
